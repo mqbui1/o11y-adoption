@@ -5,14 +5,16 @@ Audit tool for Splunk Observability Cloud adoption. Answers:
 - **How much** OpenTelemetry instrumentation has been adopted?
 - **What** assets (detectors, dashboards, tokens) are stale or unhealthy?
 
+> **Note on data availability:** The Splunk Observability audit API logs write operations (POST/PUT/DELETE) only — dashboard views and chart reads are not recorded. Time-on-page and view counts are not derivable from any available API. The tool maximizes what can be inferred from login events, write activity, and asset metadata.
+
 ## Data sources
 
 | Source | What it provides |
 |--------|-----------------|
 | `GET /v2/organization/member` | Full user roster, roles, join date |
 | `GET /v2/event/find?query=sf_eventType:SessionLog` | Login/logout events — email, auth method, timestamps |
-| `GET /v2/event/find?query=sf_eventType:HttpRequest` | Per-user API/UI actions — resources touched, write ops |
-| `GET /v2/detector`, `/v2/dashboard`, `/v2/chart` | Asset inventory + staleness |
+| `GET /v2/event/find?query=sf_eventType:HttpRequest` | Write-only audit events — resource type, method, URI, timestamp |
+| `GET /v2/detector`, `/v2/dashboard`, `/v2/chart` | Asset inventory, staleness, last-modified-by |
 | `GET /v2/token` | Token expiry / health |
 | MTS dimension search (`telemetry.sdk.*`) | OTel SDK instrumentation signals |
 | `POST /v2/apm/topology` | APM-instrumented service list |
@@ -33,34 +35,45 @@ export SPLUNK_ACCESS_TOKEN=<your-api-token>
 ### `report` — full adoption report
 
 ```bash
-python3 o11y_adoption.py report [--days 90] [--stale-days 90]
+python3 o11y_adoption.py report [--days 90] [--stale-days 90] [--no-otel] [--json]
 ```
 
-Prints a full report with sections:
+Prints a full report with the following sections:
 
-- **Platform overview** — user counts, detector/dashboard/chart totals, token health
-- **OTel & signal adoption** — APM service count, SDK-instrumented services, OTel Collector deployments, language breakdown
-- **User activity table** — all users sorted by recency: last login, last activity, login count, API calls, write ops, auth method, resource types accessed
-- **Inactive users** — users with no activity in the window
-- **Token alerts** — expired and soon-to-expire tokens
-- **Stale detectors** — not updated in `--stale-days`
-- **Stale dashboards** — not updated in `--stale-days`
+| Section | What it shows |
+|---------|---------------|
+| **Platform overview** | User counts, detector/dashboard/chart totals, token health summary |
+| **OTel & signal adoption** | APM service count, SDK-instrumented services, Collector deployments, language breakdown |
+| **User activity table** | All users sorted by recency: last login, last activity, login count, API calls, write ops, auth method, resource types |
+| **Login frequency timeline** | Logins per calendar week per user — shows engagement trends over time |
+| **Login heatmap** | Org-wide logins by day-of-week × hour-of-day (UTC) — reveals usage patterns and timezone concentration |
+| **Write activity detail** | Per-user breakdown of API mutations: grouped by method+resource type, plus 5 most recent individual operations with timestamps and URIs |
+| **Asset ownership** | Detectors, dashboards, and charts attributed to each user by `lastUpdatedBy` field |
+| **Inactive users** | Users with no login or write activity in the lookback window |
+| **Token alerts** | Expired and soon-to-expire tokens |
+| **Stale detectors** | Detectors not updated in `--stale-days` |
+| **Stale dashboards** | Dashboards not updated in `--stale-days` |
 
 **Options:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--days N` | 90 | Activity lookback window |
-| `--stale-days N` | 90 | Days without update = stale |
-| `--top-n N` | 25 | Max users in activity table |
+| `--days N` | 90 | Activity lookback window in days |
+| `--stale-days N` | 90 | Mark assets stale if not updated in N days |
+| `--no-otel` | off | Skip OTel MTS dimension scan (faster) |
+| `--json` | off | Save full raw data to `reports/` as JSON |
 
 ### `users` — user activity only
 
 ```bash
-python3 o11y_adoption.py users [--days 90] [--top-n 25]
+python3 o11y_adoption.py users [--days 90] [--inactive-only]
 ```
 
-Prints just the user activity table and inactive users list — lighter fetch (skips assets and OTel signals).
+Lightweight fetch — skips assets and OTel signals. Prints user activity table only.
+
+| Flag | Description |
+|------|-------------|
+| `--inactive-only` | Show only users with no activity in the window |
 
 ### `tokens` — token health only
 
@@ -68,58 +81,67 @@ Prints just the user activity table and inactive users list — lighter fetch (s
 python3 o11y_adoption.py tokens
 ```
 
-Lists all tokens with expiry status, disabled state, and DPM/APM limits. Flags expired and expiring-soon tokens.
+Lists all tokens with expiry status and auth scopes. Flags expired and expiring-soon tokens.
 
 ## Example output
 
 ```
-==============================================================================================================
-  Splunk Observability Adoption Report  |  realm=us1  |  2026-04-06 19:25 UTC
-  Activity window: last 90 days  |  Stale threshold: >90 days since last update
-==============================================================================================================
+  LOGIN FREQUENCY  (logins per calendar week)
+  ─────────────────────────────────────────────────────────────────
+  User                                 W01  W02  W08  W09  W10  W11  W12
+  ─────────────────────────────────────────────────────────────────
+  mbui@splunk.com [admin]                .    .    1    2    .    2    3
+  gravi@splunk.com                       .    2    .    .    1    .    .
+  douglask@splunk.com [admin]            .    .    .    .    .    .    .
 
-  PLATFORM OVERVIEW
-  ──────────────────────────────────────────────────
-  Users (total):          9
-  Users (active 90d):     7
-  Users (inactive):       2
+  LOGIN HEATMAP  (org-wide logins by day/hour UTC)
+  ───────────────────────────────────────────────────────────────────
+  Day   00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19
+  ───────────────────────────────────────────────────────────────────
+  Mon    .  .  .  .  1  .  .  .  .  .  .  .  .  .  .  .  1  .  2  .
+  Tue    .  .  .  .  .  1  .  .  .  .  .  .  .  .  .  .  1  1  .  .
+  Fri    .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  2  .  .  1  .
 
-  Detectors:     30  (10 active, 20 stale >90d)
-  Dashboards:   152  (41 active, 111 stale >90d)
-  Charts:      1000
-  Tokens:        22  (0 expiring <7d, 4 expiring <30d, 2 expired)
+  WRITE ACTIVITY DETAIL  (API mutations per user, last 90 days)
 
-  OTEL & SIGNAL ADOPTION
-  ──────────────────────────────────────────────────
-  APM services (traces):    8  api-gateway, customers-service, ...
-  OTel SDK instrumented:    6  api-gateway, vets-service, ...
-  OTel Collector:           2
-  Language — java           4  api-gateway, customers-service, ...
+  mbui@splunk.com [admin]  —  46 write op(s)
+      18x  DELETE token
+      13x  POST token
+       7x  DELETE team
+       4x  PUT token
+    Recent:
+      2026-04-06 05:38 UTC  PUT     /v2/token/_RLITHH7C8nIXRJOG4KYuQ
+      2026-04-06 05:37 UTC  PUT     /v2/token/mqbtesting-INGEST
 
-  USER ACTIVITY  (last 90 days)
-  ──────────────────────────────────────────────────
-  User                      Last Login           Last Activity        Logins  API Calls  Writes  Auth
-  ──────────────────────────────────────────────────────────────────────────────────────────────────
-  mbui@splunk.com [admin]   2026-03-25 03:37     2026-04-06 05:38          9         46      46  SSO
-  gravi@splunk.com          2026-03-11 18:20     2026-03-11 18:20          3          0       0  SSO
-  ...
-
-  TOKEN ALERTS
-  ────────────────────────────────────────────────────────────
-  [EXPIRED]       pythozeroconfig-RUM    expired 2025-06-08 14:51 UTC
-  [EXPIRING <30d] o11ymcp-API           expires in 22d
+  ASSET OWNERSHIP  (detectors / dashboards / charts by last modifier)
+  ─────────────────────────────────────────────────────────────────────
+  User                                      Detectors  Dashboards  Charts
+  ─────────────────────────────────────────────────────────────────────
+  mbui@splunk.com                                   4          35     222
+  adiaz@splunk.com                                  0           1       0
 ```
 
 ## What counts as "active"
 
-- **Login**: a `SessionLog` event with `action=session created`
-- **API activity**: an `HttpRequest` audit event attributed to the user's email
-- **Write op**: an `HttpRequest` with method `POST`, `PUT`, `PATCH`, or `DELETE`
+| Signal | Source | Notes |
+|--------|--------|-------|
+| Login | `SessionLog` event with `action=session created` | Includes SSO and password auth |
+| API write activity | `HttpRequest` event with method POST/PUT/DELETE | Only mutations are logged; GET requests are not audited |
+| Asset ownership | `lastUpdatedBy` on detector/dashboard/chart objects | Reflects who last saved the asset, not who created it |
+| Login frequency | Count of `SessionLog` events grouped by calendar week | |
 
 ## OTel detection logic
 
-The tool looks for MTS with these dimensions to infer OTel instrumentation:
+The tool scans MTS dimensions to infer OTel instrumentation coverage:
 
-- `telemetry.sdk.language` — presence indicates OTel SDK on that service
-- `telemetry.sdk.version` — OTel SDK version
-- `otelcol_*` metric name prefix — indicates OTel Collector deployment
+- `telemetry.sdk.language` — OTel SDK present on that service
+- `telemetry.sdk.version` — OTel SDK version in use
+- `otelcol_*` metric prefix — OTel Collector deployment detected
+- Semantic convention metrics (`http.server.request.duration`, `jvm.memory.used`, etc.) — further OTel SDK signal
+
+## Known limitations
+
+- **No read/view tracking** — the audit API only records write operations. Dashboard views, chart views, and SignalFlow executions are not logged and cannot be derived from any available API.
+- **Asset ownership = last modifier** — `lastUpdatedBy` reflects who last saved an asset, which may differ from the original creator.
+- **System assets** — assets created by Splunk's built-in content system appear under a system user ID (e.g. `AAAAAAAAAAA`) rather than an email.
+- **HttpRequest events** — only user-initiated API calls are captured; automated token/integration calls appear under their token's associated user if resolvable.
