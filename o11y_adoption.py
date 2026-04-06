@@ -164,12 +164,10 @@ def analyze_users(members, session_events, http_events, days=90):
     Build per-user activity profile from session + HTTP events.
     Returns list of user dicts with login/activity stats.
     """
-    # Map userId -> email from member list
-    id_to_email = {m["userId"]: m["email"] for m in members}
     email_to_member = {m["email"]: m for m in members}
 
     # Session analysis
-    logins_by_email   = defaultdict(list)   # email -> [timestamp, ...]
+    logins_by_email   = defaultdict(list)   # email -> [timestamp ms, ...]
     logouts_by_email  = defaultdict(list)
     auth_methods      = defaultdict(set)
 
@@ -178,11 +176,8 @@ def analyze_users(members, session_events, http_events, days=90):
         action = props.get("action", "")
         ts     = e.get("timestamp", 0)
         email  = props.get("email", "")
-
         if not email:
-            # token-based session — resolve via tokenId if possible
             continue
-
         if action == "session created":
             logins_by_email[email].append(ts)
             method = props.get("authMethod", "")
@@ -190,15 +185,12 @@ def analyze_users(members, session_events, http_events, days=90):
                 auth_methods[email].add(method)
         elif action == "session deleted":
             logouts_by_email[email].append(ts)
-            method = props.get("authMethod", "")
-            if method:
-                auth_methods[email].add(method)
 
     # HTTP activity analysis
-    http_by_email       = defaultdict(list)   # email -> [timestamp, ...]
-    resource_by_email   = defaultdict(set)    # email -> {resource types accessed}
-    method_by_email     = defaultdict(set)    # email -> {GET, POST, DELETE, ...}
-    write_count_email   = defaultdict(int)    # non-GET calls
+    http_by_email     = defaultdict(list)   # email -> [timestamp ms, ...]
+    resource_by_email = defaultdict(set)
+    write_count_email = defaultdict(int)
+    write_ops_detail  = defaultdict(list)   # email -> [{method, uri, resource, ts}, ...]
 
     for e in http_events:
         props  = e.get("properties", {})
@@ -207,14 +199,37 @@ def analyze_users(members, session_events, http_events, days=90):
         if not email:
             continue
         http_by_email[email].append(ts)
-        rtype = props.get("sf_resourceType", "")
+        rtype  = props.get("sf_resourceType", "")
+        method = props.get("sf_requestMethod", "")
+        uri    = props.get("sf_requestUri", "")
         if rtype:
             resource_by_email[email].add(rtype)
-        method = props.get("sf_requestMethod", "")
-        if method:
-            method_by_email[email].add(method)
         if method and method != "GET":
             write_count_email[email] += 1
+            write_ops_detail[email].append({
+                "method":   method,
+                "uri":      uri,
+                "resource": rtype,
+                "ts":       ts,
+            })
+
+    # Login frequency: logins per week bucket
+    def logins_per_week(login_ts_list, days):
+        buckets = defaultdict(int)
+        for ts in login_ts_list:
+            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+            week = dt.strftime("%Y-W%W")
+            buckets[week] += 1
+        return dict(sorted(buckets.items()))
+
+    # Login heatmap: day-of-week x hour-of-day
+    def login_heatmap(login_ts_list):
+        # Returns dict {(weekday, hour): count}
+        heatmap = defaultdict(int)
+        for ts in login_ts_list:
+            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+            heatmap[(dt.weekday(), dt.hour)] += 1
+        return dict(heatmap)
 
     # Build user profiles
     users = []
@@ -226,10 +241,8 @@ def analyze_users(members, session_events, http_events, days=90):
         http_ts  = sorted(http_by_email[email], reverse=True)
         all_ts   = sorted(logins + http_ts, reverse=True)
 
-        last_login    = logins[0]   if logins   else None
-        last_activity = all_ts[0]   if all_ts   else None
-        login_count   = len(logins)
-        http_count    = len(http_ts)
+        last_login    = logins[0] if logins  else None
+        last_activity = all_ts[0] if all_ts  else None
 
         users.append({
             "email":          email,
@@ -239,17 +252,60 @@ def analyze_users(members, session_events, http_events, days=90):
             "member_since":   member.get("created"),
             "last_login":     last_login,
             "last_activity":  last_activity,
-            "login_count":    login_count,
-            "http_count":     http_count,
+            "login_count":    len(logins),
+            "http_count":     len(http_ts),
             "write_ops":      write_count_email[email],
             "resources_used": sorted(resource_by_email[email]),
             "auth_methods":   sorted(auth_methods[email]),
             "active":         last_activity is not None,
+            "logins_per_week": logins_per_week(logins_by_email[email], days),
+            "login_heatmap":  login_heatmap(logins_by_email[email]),
+            "write_ops_detail": sorted(write_ops_detail[email], key=lambda x: x["ts"], reverse=True),
         })
 
-    # Sort: active users first, then by last activity
     users.sort(key=lambda u: (-(u["last_activity"] or 0)))
     return users
+
+
+def analyze_asset_ownership(detectors, dashboards, charts, members):
+    """
+    Build a map of user -> assets they own/last-modified.
+    Resolves userId -> email where possible.
+    Returns dict: label -> {detectors: [...], dashboards: [...], charts: [...]}
+    """
+    # Build userId -> email lookup
+    id_to_email = {m["userId"]: m["email"] for m in members}
+
+    def resolve(uid):
+        return id_to_email.get(uid, uid)  # fall back to raw ID if not found
+
+    ownership = defaultdict(lambda: {"detectors": [], "dashboards": [], "charts": []})
+
+    for d in detectors:
+        owner = resolve(d.get("lastUpdatedBy") or d.get("creator") or "")
+        if owner:
+            ownership[owner]["detectors"].append({
+                "id": d.get("id"), "name": d.get("name"),
+                "lastUpdated": d.get("lastUpdated"),
+            })
+
+    for d in dashboards:
+        owner = resolve(d.get("lastUpdatedBy") or d.get("creator") or "")
+        if owner:
+            ownership[owner]["dashboards"].append({
+                "id": d.get("id"), "name": d.get("name"),
+                "lastUpdated": d.get("lastUpdated"),
+            })
+
+    for c in charts:
+        owner = resolve(c.get("lastUpdatedBy") or c.get("creator") or "")
+        if owner:
+            ownership[owner]["charts"].append({
+                "id": c.get("id"), "name": c.get("name"),
+                "lastUpdated": c.get("lastUpdated"),
+            })
+
+    return dict(ownership)
 
 
 def analyze_assets(detectors, dashboards, charts, tokens, stale_days=90):
@@ -330,6 +386,7 @@ def print_report(members, session_events, http_events,
     users        = analyze_users(members, session_events, http_events, days)
     assets       = analyze_assets(detectors, dashboards, charts, tokens, stale_days)
     otel         = analyze_otel(otel_services, apm_services)
+    ownership    = analyze_asset_ownership(detectors, dashboards, charts, members)
     now_str      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     width        = 110
 
@@ -385,6 +442,101 @@ def print_report(members, session_events, http_events,
         print(f"  {name:<35} {last_login:<22} {last_activity:<22} "
               f"{u['login_count']:>7} {u['http_count']:>10} {u['write_ops']:>7}  "
               f"{auth:<20} {resources or '—'}")
+
+    # ── Login frequency timeline ──────────────────────────────────────────
+    active_with_logins = [u for u in users if u["logins_per_week"]]
+    if active_with_logins:
+        # Collect all week buckets across all users
+        all_weeks = sorted({w for u in active_with_logins for w in u["logins_per_week"]})
+        print(f"""
+  LOGIN FREQUENCY  (logins per calendar week)
+  {"─" * width}
+  {"User":<35}""", end="")
+        for w in all_weeks[-12:]:  # last 12 weeks max
+            print(f"  {w[5:]}", end="")  # show "W##" only
+        print()
+        print("  " + "-" * (width - 2))
+        for u in active_with_logins:
+            tag = " [admin]" if u["admin"] else ""
+            print(f"  {u['email']+tag:<35}", end="")
+            for w in all_weeks[-12:]:
+                count = u["logins_per_week"].get(w, 0)
+                cell = f"  {count:>3}" if count else "    ."
+                print(cell, end="")
+            print()
+
+    # ── Login heatmap ────────────────────────────────────────────────────
+    # Aggregate across all users to show org-wide pattern
+    DAYS_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    combined_heatmap = defaultdict(int)
+    for u in users:
+        for (dow, hr), cnt in u["login_heatmap"].items():
+            combined_heatmap[(dow, hr)] += cnt
+    if combined_heatmap:
+        print(f"""
+  LOGIN HEATMAP  (org-wide logins by day/hour UTC)
+  {"─" * 70}
+  {"Day":<5}""", end="")
+        for hr in range(0, 24):
+            print(f" {hr:02d}", end="")
+        print()
+        print("  " + "-" * 75)
+        for dow in range(7):
+            print(f"  {DAYS_ABBR[dow]:<5}", end="")
+            for hr in range(24):
+                cnt = combined_heatmap.get((dow, hr), 0)
+                if cnt == 0:
+                    print("  .", end="")
+                elif cnt <= 2:
+                    print(f"  {cnt}", end="")
+                else:
+                    print(f" {cnt:>2}", end="")
+            print()
+
+    # ── Write activity detail per user ───────────────────────────────────
+    users_with_writes = [u for u in users if u["write_ops_detail"]]
+    if users_with_writes:
+        print(f"""
+  WRITE ACTIVITY DETAIL  (API mutations per user, last {days} days)
+  {"─" * width}""")
+        for u in users_with_writes:
+            tag = " [admin]" if u["admin"] else ""
+            print(f"\n  {u['email']}{tag}  —  {u['write_ops']} write op(s)")
+            # Group by method+resource
+            by_type = defaultdict(int)
+            for op in u["write_ops_detail"]:
+                key = f"{op['method']} {op['resource'] or op['uri'].split('/')[2] if len(op['uri'].split('/')) > 2 else op['uri']}"
+                by_type[key] += 1
+            for key, cnt in sorted(by_type.items(), key=lambda x: -x[1]):
+                print(f"    {cnt:>4}x  {key}")
+            # Show 5 most recent individual ops
+            print(f"    Recent:")
+            for op in u["write_ops_detail"][:5]:
+                print(f"      {ts_to_str(op['ts'])}  {op['method']:<7} {op['uri']}")
+
+    # ── Asset ownership map ───────────────────────────────────────────────
+    if ownership:
+        print(f"""
+  ASSET OWNERSHIP  (detectors / dashboards / charts by last modifier)
+  {"─" * width}
+  {"User":<40} {"Detectors":>10} {"Dashboards":>11} {"Charts":>7}  Most Recently Modified""")
+        print("  " + "-" * (width - 2))
+        for owner, owned in sorted(ownership.items(),
+                                   key=lambda x: -(len(x[1]["detectors"]) +
+                                                   len(x[1]["dashboards"]) +
+                                                   len(x[1]["charts"]))):
+            n_det  = len(owned["detectors"])
+            n_dash = len(owned["dashboards"])
+            n_ch   = len(owned["charts"])
+            # Most recently modified asset
+            all_owned = (
+                [(a["lastUpdated"] or 0, "detector",  a["name"]) for a in owned["detectors"]] +
+                [(a["lastUpdated"] or 0, "dashboard", a["name"]) for a in owned["dashboards"]] +
+                [(a["lastUpdated"] or 0, "chart",     a["name"]) for a in owned["charts"]]
+            )
+            recent = sorted(all_owned, key=lambda x: -x[0])
+            recent_str = f"{recent[0][1]}: {recent[0][2][:35]}" if recent else "—"
+            print(f"  {owner:<40} {n_det:>10} {n_dash:>11} {n_ch:>7}  {recent_str}")
 
     # ── Inactive users ────────────────────────────────────────────────────
     if inactive_users:
