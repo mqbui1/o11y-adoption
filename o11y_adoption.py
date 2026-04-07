@@ -73,14 +73,25 @@ def fetch_members():
     return data.get("results", [])
 
 
-def fetch_session_events(days=90):
-    start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-    return event_find("sf_eventType:SessionLog", start_ms)
+def fetch_session_events(days=90, since_ms=None, until_ms=None):
+    start_ms = since_ms or int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+    events = event_find("sf_eventType:SessionLog", start_ms)
+    if until_ms:
+        events = [e for e in events if e.get("timestamp", 0) <= until_ms]
+    return events
 
 
-def fetch_http_events(days=90):
-    start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-    return event_find("sf_eventType:HttpRequest", start_ms)
+def fetch_http_events(days=90, since_ms=None, until_ms=None):
+    start_ms = since_ms or int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+    events = event_find("sf_eventType:HttpRequest", start_ms)
+    if until_ms:
+        events = [e for e in events if e.get("timestamp", 0) <= until_ms]
+    return events
+
+
+def fetch_teams():
+    data = api_get("/v2/team", params={"limit": 1000})
+    return data.get("results", [])
 
 
 def fetch_assets():
@@ -474,26 +485,158 @@ def analyze_otel(otel_services, apm_services):
     }
 
 
+def analyze_teams(teams, members, users, ownership):
+    """Group user activity and asset ownership by team."""
+    id_to_email = {m["userId"]: m["email"] for m in members}
+    email_to_user = {u["email"]: u for u in users}
+
+    results = []
+    for team in teams:
+        member_ids = team.get("members", [])
+        emails = [id_to_email[mid] for mid in member_ids if mid in id_to_email]
+        team_users = [email_to_user[e] for e in emails if e in email_to_user]
+
+        active = sum(1 for u in team_users if u["active"])
+        logins = sum(u["login_count"] for u in team_users)
+        writes = sum(u["write_ops"] for u in team_users)
+        avg_score = round(sum(u.get("engagement_score", 0) for u in team_users) / len(team_users)) if team_users else 0
+
+        det  = sum(len(ownership.get(e, {}).get("detectors",  [])) for e in emails)
+        dash = sum(len(ownership.get(e, {}).get("dashboards", [])) for e in emails)
+        ch   = sum(len(ownership.get(e, {}).get("charts",     [])) for e in emails)
+
+        results.append({
+            "name":        team.get("name", "—"),
+            "id":          team.get("id"),
+            "member_count": len(emails),
+            "active":      active,
+            "logins":      logins,
+            "writes":      writes,
+            "avg_score":   avg_score,
+            "detectors":   det,
+            "dashboards":  dash,
+            "charts":      ch,
+            "emails":      emails,
+        })
+
+    results.sort(key=lambda t: -t["avg_score"])
+    return results
+
+
+def analyze_detector_health(detectors, tokens):
+    """Flag detectors that are muted, have no notifications, or are disabled."""
+    token_map = {t["id"]: t for t in tokens}
+    issues = []
+    for d in detectors:
+        flags = []
+        if not d.get("teams") and not d.get("notifications"):
+            flags.append("no-notifications")
+        if d.get("disabled"):
+            flags.append("disabled")
+        # muted: check if any active muting rules reference this detector
+        # (muting rules fetched separately — flag here if present in detector obj)
+        if d.get("muted"):
+            flags.append("muted")
+        if flags:
+            issues.append({
+                "id":          d.get("id"),
+                "name":        d.get("name", "—"),
+                "lastUpdated": d.get("lastUpdated"),
+                "owner":       d.get("lastUpdatedBy", "—"),
+                "flags":       flags,
+            })
+    return issues
+
+
+def analyze_token_attribution(session_events, members, tokens):
+    """
+    Cross-reference tokenId in SessionLog events with token objects
+    to identify which tokens are shared across users vs personal.
+    """
+    id_to_email  = {m["userId"]: m["email"] for m in members}
+    token_map    = {t["id"]: t for t in tokens}
+    token_users  = defaultdict(set)   # tokenId -> set of emails
+
+    for e in session_events:
+        props   = e.get("properties", {})
+        email   = props.get("email", "")
+        tok_id  = props.get("tokenId", "")
+        if email and tok_id:
+            token_users[tok_id].add(email)
+
+    results = []
+    for tok_id, emails in token_users.items():
+        tok = token_map.get(tok_id, {})
+        results.append({
+            "token_id":   tok_id,
+            "token_name": tok.get("name", tok_id),
+            "scopes":     ", ".join(tok.get("authScopes", [])),
+            "user_count": len(emails),
+            "emails":     sorted(emails),
+            "shared":     len(emails) > 1,
+        })
+    results.sort(key=lambda x: -x["user_count"])
+    return results
+
+
+def save_csv(users, ownership, path=None):
+    import csv
+    REPORTS_DIR.mkdir(exist_ok=True)
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = path or REPORTS_DIR / f"adoption_users_{ts}.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "email", "admin", "engagement_score",
+            "last_login", "last_activity", "member_since",
+            "login_count", "write_ops",
+            "detectors_owned", "dashboards_owned", "charts_owned",
+            "resources_used", "auth_methods",
+        ])
+        for u in users:
+            owned = ownership.get(u["email"], {})
+            w.writerow([
+                u["email"],
+                u["admin"],
+                u.get("engagement_score", ""),
+                ts_to_str(u["last_login"]),
+                ts_to_str(u["last_activity"]),
+                ts_to_str(u["member_since"]),
+                u["login_count"],
+                u["write_ops"],
+                len(owned.get("detectors",  [])),
+                len(owned.get("dashboards", [])),
+                len(owned.get("charts",     [])),
+                "|".join(u["resources_used"]),
+                "|".join(u["auth_methods"]),
+            ])
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
 def print_report(members, session_events, http_events,
                  detectors, dashboards, charts, tokens,
-                 otel_services, apm_services,
-                 days=90, stale_days=90):
+                 otel_services, apm_services, teams=None,
+                 days=90, stale_days=90, csv_path=None):
 
     users        = analyze_users(members, session_events, http_events, days)
     assets       = analyze_assets(detectors, dashboards, charts, tokens, stale_days)
     otel         = analyze_otel(otel_services, apm_services)
     ownership    = analyze_asset_ownership(detectors, dashboards, charts, members)
     org_health   = compute_org_health(users, assets, otel, days)
+    det_issues   = analyze_detector_health(detectors, tokens)
+    tok_attr     = analyze_token_attribution(session_events, members, tokens)
     now_str      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     width        = 110
 
     # Add engagement score to each user
     for u in users:
         u["engagement_score"] = score_user_engagement(u, ownership, days)
+
+    team_data = analyze_teams(teams or [], members, users, ownership) if teams else []
 
     print()
     print("=" * width)
@@ -657,6 +800,43 @@ def print_report(members, session_events, http_events,
             recent_str = f"{recent[0][1]}: {recent[0][2][:35]}" if recent else "—"
             print(f"  {owner:<40} {n_det:>10} {n_dash:>11} {n_ch:>7}  {recent_str}")
 
+    # ── Team rollup ───────────────────────────────────────────────────────
+    if team_data:
+        print(f"""
+  TEAM ROLLUP
+  {"─" * width}
+  {"Team":<30} {"Members":>8} {"Active":>7} {"Avg Score":>10} {"Logins":>7} {"Writes":>7} {"Det":>5} {"Dash":>6} {"Charts":>7}""")
+        print("  " + "-" * (width - 2))
+        for t in team_data:
+            print(f"  {t['name']:<30} {t['member_count']:>8} {t['active']:>7} "
+                  f"{t['avg_score']:>10} {t['logins']:>7} {t['writes']:>7} "
+                  f"{t['detectors']:>5} {t['dashboards']:>6} {t['charts']:>7}")
+
+    # ── Detector health issues ────────────────────────────────────────────
+    if det_issues:
+        print(f"""
+  DETECTOR HEALTH ISSUES  — {len(det_issues)} detector(s) flagged
+  {"─" * width}
+  {"Name":<50} {"Last Updated":<22} {"Flags"}""")
+        print("  " + "-" * (width - 2))
+        for d in sorted(det_issues, key=lambda x: x.get("lastUpdated") or 0, reverse=True)[:20]:
+            flags = ", ".join(d["flags"])
+            print(f"  {d['name']:<50} {ts_to_str(d['lastUpdated']):<22} {flags}")
+        if len(det_issues) > 20:
+            print(f"  ... and {len(det_issues) - 20} more")
+
+    # ── Token attribution ─────────────────────────────────────────────────
+    if tok_attr:
+        print(f"""
+  TOKEN ATTRIBUTION  (tokens seen in login events)
+  {"─" * 70}
+  {"Token":<35} {"Scopes":<12} {"Users":>6}  Users""")
+        print("  " + "-" * 70)
+        for t in tok_attr:
+            shared_tag = " [SHARED]" if t["shared"] else ""
+            users_str  = ", ".join(t["emails"][:3]) + ("..." if len(t["emails"]) > 3 else "")
+            print(f"  {t['token_name']:<35} {t['scopes']:<12} {t['user_count']:>6}  {users_str}{shared_tag}")
+
     # ── Inactive users ────────────────────────────────────────────────────
     if inactive_users:
         print(f"""
@@ -706,6 +886,11 @@ def print_report(members, session_events, http_events,
         if len(stale_dash) > 15:
             print(f"  ... and {len(stale_dash) - 15} more")
 
+    # ── CSV export ────────────────────────────────────────────────────────
+    if csv_path is not None:
+        out = save_csv(users, ownership, path=csv_path if csv_path != True else None)
+        print(f"\n  CSV saved: {out}")
+
     print()
 
 
@@ -731,19 +916,36 @@ def main():
     p_report = sub.add_parser("report", help="Full adoption report — users, assets, OTel coverage")
     p_report.add_argument("--days",       type=int, default=90,
                           help="Activity window in days (default: 90)")
+    p_report.add_argument("--since",      help="Start date YYYY-MM-DD (overrides --days)")
+    p_report.add_argument("--until",      help="End date YYYY-MM-DD (default: now)")
     p_report.add_argument("--stale-days", type=int, default=90,
                           help="Mark assets stale if not updated in N days (default: 90)")
     p_report.add_argument("--json",       action="store_true",
                           help="Also save full data as JSON to reports/")
+    p_report.add_argument("--csv",        action="store_true",
+                          help="Save user activity table as CSV to reports/")
     p_report.add_argument("--no-otel",    action="store_true",
                           help="Skip OTel MTS dimension scan (faster)")
+    p_report.add_argument("--no-teams",   action="store_true",
+                          help="Skip team rollup section")
 
     p_users = sub.add_parser("users", help="User activity summary only")
-    p_users.add_argument("--days", type=int, default=90)
+    p_users.add_argument("--days",          type=int, default=90)
+    p_users.add_argument("--since",         help="Start date YYYY-MM-DD (overrides --days)")
+    p_users.add_argument("--until",         help="End date YYYY-MM-DD (default: now)")
     p_users.add_argument("--inactive-only", action="store_true",
                          help="Show only users with no activity in the window")
+    p_users.add_argument("--csv",           action="store_true",
+                         help="Save results as CSV to reports/")
 
     p_tokens = sub.add_parser("tokens", help="Token health — expiring and expired tokens")
+
+    p_timeline = sub.add_parser("activity-timeline",
+                                help="Chronological write-event timeline for a specific user")
+    p_timeline.add_argument("--user",  required=True, help="User email address")
+    p_timeline.add_argument("--days",  type=int, default=90)
+    p_timeline.add_argument("--since", help="Start date YYYY-MM-DD")
+    p_timeline.add_argument("--until", help="End date YYYY-MM-DD")
 
     args = parser.parse_args()
 
@@ -751,14 +953,36 @@ def main():
         print("Error: SPLUNK_ACCESS_TOKEN not set")
         sys.exit(1)
 
+    def parse_date_ms(date_str, end_of_day=False):
+        """Parse YYYY-MM-DD to milliseconds."""
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return int(dt.timestamp() * 1000)
+
+    def resolve_window(args):
+        """Return (since_ms, until_ms, effective_days) from --since/--until/--days."""
+        until_ms = parse_date_ms(args.until, end_of_day=True) if getattr(args, "until", None) else None
+        if getattr(args, "since", None):
+            since_ms = parse_date_ms(args.since)
+            end_ms   = until_ms or int(time.time() * 1000)
+            eff_days = max(1, int((end_ms - since_ms) / (86400 * 1000)))
+        else:
+            since_ms = None
+            eff_days = args.days
+        return since_ms, until_ms, eff_days
+
     if args.command == "report":
-        print(f"Fetching data from realm={REALM}...")
+        since_ms, until_ms, eff_days = resolve_window(args)
+        window_desc = (f"{args.since} → {args.until or 'now'}"
+                       if getattr(args, "since", None) else f"last {eff_days}d")
+        print(f"Fetching data from realm={REALM} ({window_desc})...")
         print("  members...")
         members = fetch_members()
-        print(f"  session events (last {args.days}d)...")
-        session_events = fetch_session_events(args.days)
-        print(f"  HTTP audit events (last {args.days}d)...")
-        http_events = fetch_http_events(args.days)
+        print("  session events...")
+        session_events = fetch_session_events(eff_days, since_ms, until_ms)
+        print("  HTTP audit events...")
+        http_events = fetch_http_events(eff_days, since_ms, until_ms)
         print("  assets (detectors, dashboards, charts, tokens)...")
         detectors, dashboards, charts, tokens = fetch_assets()
 
@@ -770,10 +994,16 @@ def main():
             print("  APM topology...")
             apm_services  = fetch_apm_services()
 
+        teams = []
+        if not args.no_teams:
+            print("  teams...")
+            teams = fetch_teams()
+
         print_report(members, session_events, http_events,
                      detectors, dashboards, charts, tokens,
-                     otel_services, apm_services,
-                     days=args.days, stale_days=args.stale_days)
+                     otel_services, apm_services, teams=teams,
+                     days=eff_days, stale_days=args.stale_days,
+                     csv_path=True if args.csv else None)
 
         if args.json:
             path = save_json({
@@ -793,25 +1023,33 @@ def main():
             print(f"  JSON saved: {path}")
 
     elif args.command == "users":
-        print(f"Fetching user activity (last {args.days}d)...")
+        since_ms, until_ms, eff_days = resolve_window(args)
+        print(f"Fetching user activity...")
         members        = fetch_members()
-        session_events = fetch_session_events(args.days)
-        http_events    = fetch_http_events(args.days)
-        users          = analyze_users(members, session_events, http_events, args.days)
+        session_events = fetch_session_events(eff_days, since_ms, until_ms)
+        http_events    = fetch_http_events(eff_days, since_ms, until_ms)
+        users          = analyze_users(members, session_events, http_events, eff_days)
+        ownership      = analyze_asset_ownership([], [], [], members)
 
         if args.inactive_only:
             users = [u for u in users if not u["active"]]
-            print(f"\nInactive users (no activity in last {args.days}d): {len(users)}\n")
+            print(f"\nInactive users: {len(users)}\n")
         else:
-            print(f"\nUser activity (last {args.days}d):\n")
+            print(f"\nUser activity:\n")
 
-        print(f"  {'User':<35} {'Last Login':<22} {'Logins':>7} {'API Calls':>10}  {'Auth'}")
+        for u in users:
+            u["engagement_score"] = score_user_engagement(u, ownership, eff_days)
+
+        print(f"  {'User':<35} {'Score':>6}  {'Last Login':<22} {'Logins':>7} {'Writes':>7}")
         print("  " + "-" * 85)
         for u in users:
-            ll   = ts_to_str(u["last_login"]) if u["last_login"] else "never"
-            auth = ", ".join(u["auth_methods"][:1]) or "—"
-            tag  = " [admin]" if u["admin"] else ""
-            print(f"  {u['email']+tag:<35} {ll:<22} {u['login_count']:>7} {u['http_count']:>10}  {auth}")
+            ll  = ts_to_str(u["last_login"]) if u["last_login"] else "never"
+            tag = " [admin]" if u["admin"] else ""
+            print(f"  {u['email']+tag:<35} {u['engagement_score']:>3}/100  {ll:<22} {u['login_count']:>7} {u['write_ops']:>7}")
+
+        if args.csv:
+            path = save_csv(users, ownership)
+            print(f"\n  CSV saved: {path}")
 
     elif args.command == "tokens":
         print("Fetching tokens...")
@@ -840,6 +1078,40 @@ def main():
                 exp_str = "—"
             scopes = ", ".join(t.get("authScopes", []))
             print(f"  {t['name']:<40} {scopes:<10} {exp_str:<22} {status}")
+
+    elif args.command == "activity-timeline":
+        since_ms, until_ms, eff_days = resolve_window(args)
+        print(f"Fetching activity timeline for {args.user}...")
+        http_events = fetch_http_events(eff_days, since_ms, until_ms)
+        session_events = fetch_session_events(eff_days, since_ms, until_ms)
+
+        # Filter to this user
+        user_http = [e for e in http_events
+                     if e.get("properties", {}).get("sf_email") == args.user]
+        user_logins = [e for e in session_events
+                       if e.get("properties", {}).get("email") == args.user
+                       and e.get("properties", {}).get("action") == "session created"]
+
+        all_events = (
+            [(e["timestamp"], "LOGIN",
+              e.get("properties", {}).get("authMethod", ""),
+              "") for e in user_logins] +
+            [(e["timestamp"],
+              e.get("properties", {}).get("sf_requestMethod", ""),
+              e.get("properties", {}).get("sf_resourceType", ""),
+              e.get("properties", {}).get("sf_requestUri", "")) for e in user_http]
+        )
+        all_events.sort(key=lambda x: x[0])
+
+        if not all_events:
+            print(f"  No activity found for {args.user} in this window.")
+        else:
+            print(f"\n  Activity timeline for {args.user}  ({len(all_events)} events)\n")
+            print(f"  {'Timestamp':<22} {'Action':<8} {'Resource/Detail'}")
+            print("  " + "-" * 70)
+            for ts, action, resource, uri in all_events:
+                detail = uri or resource or "—"
+                print(f"  {ts_to_str(ts):<22} {action:<8} {detail}")
 
     else:
         parser.print_help()
