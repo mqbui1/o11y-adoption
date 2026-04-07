@@ -134,16 +134,51 @@ def fetch_otel_signals():
     }
 
 
-def fetch_apm_services():
+def fetch_apm_topology():
+    """Fetch full APM topology: nodes (services + inferred deps) and edges."""
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     week_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 604800))
     try:
         r = requests.post(f"{API_BASE}/v2/apm/topology",
                           headers=HDR, json={"timeRange": f"{week_ago}/{now}"}, timeout=30)
-        nodes = (r.json().get("data") or {}).get("nodes", [])
-        return [n for n in nodes if not n.get("inferred")]
+        data = r.json().get("data") or {}
+        return data.get("nodes", []), data.get("edges", [])
+    except Exception:
+        return [], []
+
+
+def fetch_apm_services():
+    nodes, _ = fetch_apm_topology()
+    return [n for n in nodes if not n.get("inferred")]
+
+
+def fetch_deployment_environments():
+    """Return list of deployment environment values from dimension API."""
+    try:
+        r = api_get("/v2/dimension", {"query": "key:deployment.environment", "limit": 200})
+        return sorted({d["value"] for d in r.get("results", [])})
     except Exception:
         return []
+
+
+def fetch_service_languages():
+    """
+    Build a dict of service_name -> language by querying service.name dimensions
+    and checking their customProperties for telemetry.sdk.language.
+    Returns dict: {service: language_str}
+    """
+    try:
+        rs = api_get("/v2/dimension", {"query": "key:service.name", "limit": 500})
+        svc_lang_map = {}
+        for svc_dim in rs.get("results", []):
+            svc_name = svc_dim.get("value", "")
+            props = svc_dim.get("customProperties", {})
+            lang = props.get("telemetry.sdk.language")
+            if lang and svc_name:
+                svc_lang_map[svc_name] = lang
+        return svc_lang_map
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +497,99 @@ def analyze_otel(otel_signals, apm_services):
     }
 
 
+def analyze_app_insights(apm_nodes, apm_edges, otel_signals, svc_lang_map, environments):
+    """
+    Derive application onboarding insights from APM topology and dimension data.
+
+    Returns dict with:
+      - services: list of real (non-inferred) services with language and type
+      - inferred_deps: databases, external HTTP, and other inferred nodes
+      - dependency_graph: list of {from, to} service-to-service calls
+      - language_breakdown: {lang: count}
+      - environments: list of deployment environments
+      - stack_types: inferred stack classifications (e.g. "Java microservices")
+      - service_graph_summary: hub services (most depended-upon)
+    """
+    real_services = [n for n in apm_nodes if not n.get("inferred")]
+    inferred_deps = [n for n in apm_nodes if n.get("inferred")]
+
+    # Per-service language from dimension API
+    enriched_services = []
+    for n in real_services:
+        svc = n.get("serviceName", "")
+        lang = svc_lang_map.get(svc, "")
+        enriched_services.append({
+            "name":     svc,
+            "language": lang,
+            "type":     n.get("type", "service"),
+        })
+
+    # Inferred dependency types
+    dep_types = defaultdict(int)
+    for n in inferred_deps:
+        ntype = n.get("type", "unknown")
+        dep_types[ntype] += 1
+
+    # Service-to-service dependency graph
+    svc_names = {n.get("serviceName") for n in real_services}
+    dep_graph = []
+    in_degree = defaultdict(int)   # how many services call this one
+    out_degree = defaultdict(int)  # how many services this one calls
+
+    for edge in apm_edges:
+        src = edge.get("from", "")
+        dst = edge.get("to", "")
+        if src and dst:
+            dep_graph.append({"from": src, "to": dst})
+            out_degree[src] += 1
+            in_degree[dst] += 1
+
+    # Hub services = highest in-degree (most depended-upon)
+    hub_services = sorted(svc_names, key=lambda s: -in_degree.get(s, 0))[:5]
+
+    # Language breakdown across all services
+    lang_counts = defaultdict(int)
+    for s in enriched_services:
+        if s["language"]:
+            lang_counts[s["language"]] += 1
+    # Fall back to org-wide language signals if per-service map is sparse
+    if not lang_counts and otel_signals.get("languages"):
+        for lang in otel_signals["languages"]:
+            lang_counts[lang] = 0  # count unknown but present
+
+    # Stack type fingerprinting
+    stack_types = []
+    langs = set(lang_counts.keys()) or set(otel_signals.get("languages", []))
+    if "java" in langs and len(real_services) >= 3:
+        stack_types.append("Java microservices")
+    if "python" in langs:
+        stack_types.append("Python services")
+    if "nodejs" in langs or "node" in langs:
+        stack_types.append("Node.js services")
+    if "go" in langs:
+        stack_types.append("Go services")
+    if "dotnet" in langs or "generic" in langs:
+        stack_types.append(".NET/generic services")
+    if dep_types.get("database", 0) > 0:
+        stack_types.append(f"{dep_types['database']} database(s) detected")
+    if not stack_types and real_services:
+        stack_types.append("Mixed/unknown languages")
+
+    return {
+        "services":           enriched_services,
+        "service_count":      len(real_services),
+        "inferred_deps":      inferred_deps,
+        "inferred_dep_types": dict(dep_types),
+        "dependency_graph":   dep_graph,
+        "in_degree":          dict(in_degree),
+        "out_degree":         dict(out_degree),
+        "hub_services":       hub_services,
+        "language_breakdown": dict(lang_counts),
+        "environments":       environments,
+        "stack_types":        stack_types,
+    }
+
+
 def analyze_teams(teams, members, users, ownership):
     """Group user activity and asset ownership by team."""
     id_to_email = {m["userId"]: m["email"] for m in members}
@@ -556,9 +684,74 @@ def analyze_token_attribution(session_events, members, tokens):
     return results
 
 
+def _html_app_insights(ai):
+    """Render the Application Insights card HTML."""
+    if not ai:
+        return ""
+
+    # Service rows
+    svc_rows = ""
+    for s in sorted(ai["services"], key=lambda x: x["name"]):
+        lang_badge = (f'<span style="background:#8b5cf6;color:#fff;padding:1px 7px;'
+                      f'border-radius:9px;font-size:11px">{s["language"]}</span>'
+                      if s["language"] else "—")
+        hub = "★" if s["name"] in ai["hub_services"][:3] else ""
+        callers = ai["in_degree"].get(s["name"], 0)
+        callees = ai["out_degree"].get(s["name"], 0)
+        svc_rows += (f'<tr><td>{hub} {s["name"]}</td><td>{lang_badge}</td>'
+                     f'<td style="text-align:center">{callers}</td>'
+                     f'<td style="text-align:center">{callees}</td></tr>')
+
+    # Inferred dep rows
+    dep_rows = ""
+    for n in sorted(ai["inferred_deps"], key=lambda x: x.get("serviceName", "")):
+        dep_rows += (f'<tr><td>{n.get("serviceName","?")}</td>'
+                     f'<td><span style="background:#64748b;color:#fff;padding:1px 7px;'
+                     f'border-radius:9px;font-size:11px">{n.get("type","unknown")}</span></td></tr>')
+
+    # Language breakdown badges
+    lang_badges = ""
+    for lang, cnt in sorted(ai["language_breakdown"].items(), key=lambda x: -x[1]):
+        lang_badges += (f'<span style="background:#3b82f6;color:#fff;padding:3px 10px;'
+                        f'border-radius:12px;font-size:12px;margin:2px;display:inline-block">'
+                        f'{lang} ({cnt})</span> ')
+
+    # Stack type badges
+    stack_badges = ""
+    for st in ai["stack_types"]:
+        stack_badges += (f'<span style="background:#10b981;color:#fff;padding:3px 10px;'
+                         f'border-radius:12px;font-size:12px;margin:2px;display:inline-block">'
+                         f'{st}</span> ')
+
+    # Environment badges
+    env_badges = ""
+    for env in ai["environments"]:
+        env_badges += (f'<span style="background:#f59e0b;color:#fff;padding:3px 10px;'
+                       f'border-radius:12px;font-size:12px;margin:2px;display:inline-block">'
+                       f'{env}</span> ')
+
+    return f"""
+  <div class="card">
+    <h2>Application Insights</h2>
+    <div class="stat-grid" style="margin-bottom:20px">
+      <div class="stat"><div class="val">{ai['service_count']}</div><div class="lbl">Services</div></div>
+      <div class="stat"><div class="val">{len(ai['inferred_deps'])}</div><div class="lbl">Inferred Deps</div></div>
+      <div class="stat"><div class="val">{len(ai['dependency_graph'])}</div><div class="lbl">Service Calls</div></div>
+      <div class="stat"><div class="val">{len(ai['environments'])}</div><div class="lbl">Environments</div></div>
+    </div>
+    {'<div style="margin-bottom:10px"><b style="font-size:12px;color:#64748b">STACK TYPES</b><br>' + stack_badges + '</div>' if stack_badges else ''}
+    {'<div style="margin-bottom:10px"><b style="font-size:12px;color:#64748b">LANGUAGES</b><br>' + lang_badges + '</div>' if lang_badges else ''}
+    {'<div style="margin-bottom:16px"><b style="font-size:12px;color:#64748b">ENVIRONMENTS</b><br>' + env_badges + '</div>' if env_badges else ''}
+    <div style="display:flex;gap:20px;flex-wrap:wrap">
+      {'<div style="flex:2;min-width:300px"><b style="font-size:12px;color:#64748b">SERVICES</b><table style="margin-top:8px"><thead><tr><th>Service</th><th>Language</th><th style="text-align:center">Called By</th><th style="text-align:center">Calls</th></tr></thead><tbody>' + svc_rows + '</tbody></table></div>' if svc_rows else ''}
+      {'<div style="flex:1;min-width:200px"><b style="font-size:12px;color:#64748b">INFERRED DEPENDENCIES</b><table style="margin-top:8px"><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>' + dep_rows + '</tbody></table></div>' if dep_rows else ''}
+    </div>
+  </div>"""
+
+
 def save_html(users, assets, otel, ownership, org_health, team_data,
               det_issues, tok_attr, detectors, dashboards, tokens,
-              days, stale_days, realm, path=None):
+              days, stale_days, realm, path=None, app_insights=None):
     REPORTS_DIR.mkdir(exist_ok=True)
     ts_str   = datetime.now().strftime("%Y%m%d_%H%M%S")
     path     = path or REPORTS_DIR / f"adoption_report_{ts_str}.html"
@@ -794,6 +987,9 @@ def save_html(users, assets, otel, ownership, org_health, team_data,
     </div>
   </div>
 
+  <!-- APPLICATION INSIGHTS -->
+  {_html_app_insights(app_insights) if app_insights and app_insights.get('service_count', 0) > 0 else ''}
+
   <!-- USER ACTIVITY -->
   <div class="card">
     <h2>User Activity</h2>
@@ -875,7 +1071,8 @@ def save_csv(users, ownership, path=None):
 def print_report(members, session_events, http_events,
                  detectors, dashboards, charts, tokens,
                  otel_services, apm_services, teams=None,
-                 days=90, stale_days=90, csv_path=None, html_path=None):
+                 days=90, stale_days=90, csv_path=None, html_path=None,
+                 apm_nodes=None, apm_edges=None, environments=None, svc_lang_map=None):
 
     users        = analyze_users(members, session_events, http_events, days)
     assets       = analyze_assets(detectors, dashboards, charts, tokens, stale_days)
@@ -884,6 +1081,10 @@ def print_report(members, session_events, http_events,
     org_health   = compute_org_health(users, assets, otel, days)
     det_issues   = analyze_detector_health(detectors, tokens)
     tok_attr     = analyze_token_attribution(session_events, members, tokens)
+    app_insights = analyze_app_insights(
+        apm_nodes or apm_services, apm_edges or [], otel_services,
+        svc_lang_map or {}, environments or []
+    )
     now_str      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     width        = 110
 
@@ -942,6 +1143,47 @@ def print_report(members, session_events, http_events,
   OTel Collector:                     {coll_str}
   SDK languages detected:             {lang_list}
   SDK names detected:                 {sdk_list}""")
+
+    # ── Application onboarding insights ──────────────────────────────────
+    ai = app_insights
+    if ai["service_count"] > 0 or ai["environments"]:
+        print(f"""
+  APPLICATION INSIGHTS
+  {"─" * width}""")
+        # Environments
+        if ai["environments"]:
+            print(f"  Environments:    {', '.join(ai['environments'])}")
+        # Stack types
+        if ai["stack_types"]:
+            print(f"  Stack types:     {', '.join(ai['stack_types'])}")
+        # Language breakdown
+        if ai["language_breakdown"]:
+            lang_parts = [f"{lang} ({cnt})" for lang, cnt in
+                          sorted(ai["language_breakdown"].items(), key=lambda x: -x[1])]
+            print(f"  Languages:       {', '.join(lang_parts)}")
+        # Service inventory
+        if ai["services"]:
+            print(f"\n  Services ({ai['service_count']}):")
+            for s in sorted(ai["services"], key=lambda x: x["name"]):
+                lang_tag = f"  [{s['language']}]" if s["language"] else ""
+                hub_tag  = "  ★ hub" if s["name"] in ai["hub_services"][:3] else ""
+                print(f"    {s['name']:<35}{lang_tag}{hub_tag}")
+        # Inferred dependencies
+        if ai["inferred_deps"]:
+            dep_parts = []
+            for dtype, cnt in sorted(ai["inferred_dep_types"].items()):
+                dep_parts.append(f"{cnt} {dtype}(s)")
+            print(f"\n  Inferred dependencies:  {', '.join(dep_parts)}")
+            for n in sorted(ai["inferred_deps"], key=lambda x: x.get("serviceName", "")):
+                print(f"    {n.get('serviceName', '?'):<35}  [{n.get('type','unknown')}]")
+        # Hub services (most called)
+        real_hubs = [s for s in ai["hub_services"] if ai["in_degree"].get(s, 0) > 0]
+        if real_hubs:
+            print(f"\n  Most-depended-upon services:")
+            for svc in real_hubs[:5]:
+                callers = ai["in_degree"].get(svc, 0)
+                callees = ai["out_degree"].get(svc, 0)
+                print(f"    {svc:<35}  called by {callers} service(s), calls {callees}")
 
     # ── User activity table ───────────────────────────────────────────────
     print(f"""
@@ -1154,6 +1396,7 @@ def print_report(members, session_events, http_events,
             det_issues, tok_attr, detectors, dashboards, tokens,
             days, stale_days, REALM,
             path=html_path if html_path != True else None,
+            app_insights=app_insights,
         )
         print(f"\n  HTML saved: {out}")
 
@@ -1256,11 +1499,20 @@ def main():
 
         otel_services = {}
         apm_services  = []
+        apm_nodes     = []
+        apm_edges     = []
+        environments  = []
+        svc_lang_map  = {}
         if not args.no_otel:
-            print("  OTel MTS dimensions...")
+            print("  OTel dimensions...")
             otel_services = fetch_otel_signals()
             print("  APM topology...")
-            apm_services  = fetch_apm_services()
+            apm_nodes, apm_edges = fetch_apm_topology()
+            apm_services = [n for n in apm_nodes if not n.get("inferred")]
+            print("  Deployment environments...")
+            environments = fetch_deployment_environments()
+            print("  Per-service languages...")
+            svc_lang_map = fetch_service_languages()
 
         teams = []
         if not args.no_teams:
@@ -1272,7 +1524,9 @@ def main():
                      otel_services, apm_services, teams=teams,
                      days=eff_days, stale_days=args.stale_days,
                      csv_path=True if args.csv else None,
-                     html_path=True if args.html else None)
+                     html_path=True if args.html else None,
+                     apm_nodes=apm_nodes, apm_edges=apm_edges,
+                     environments=environments, svc_lang_map=svc_lang_map)
 
         if args.json:
             path = save_json({
@@ -1282,12 +1536,11 @@ def main():
                 "detectors": detectors,
                 "dashboards": dashboards,
                 "tokens": tokens,
-                "otel_services": {k: {**v, "language": list(v["language"]),
-                                       "sdk_version": list(v["sdk_version"]),
-                                       "collector_version": list(v["collector_version"]),
-                                       "metrics": list(v["metrics"])}
-                                   for k, v in otel_services.items()},
-                "apm_services": apm_services,
+                "otel_signals": otel_services,
+                "apm_nodes": apm_nodes,
+                "apm_edges": apm_edges,
+                "environments": environments,
+                "svc_lang_map": svc_lang_map,
             })
             print(f"  JSON saved: {path}")
 
