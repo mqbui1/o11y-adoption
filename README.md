@@ -17,7 +17,9 @@ Audit tool for Splunk Observability Cloud adoption. Answers:
 | `GET /v2/event/find?query=sf_eventType:HttpRequest` | Write-only audit events — resource type, method, URI, timestamp |
 | `GET /v2/detector`, `/v2/dashboard`, `/v2/chart` | Asset inventory, staleness, last-modified-by |
 | `GET /v2/token` | Token expiry / health |
-| MTS dimension search (`telemetry.sdk.*`) | OTel SDK instrumentation signals |
+| `GET /v2/dimension?query=key:telemetry.sdk.*` | OTel SDK language and version signals |
+| `GET /v2/dimension?query=key:telemetry.sdk.name` | OTel SDK name (opentelemetry, beyla, etc.) |
+| `GET /v2/dimension?query=key:otelcol*` | OTel Collector presence |
 | `POST /v2/apm/topology` | APM-instrumented service list |
 
 ## Setup
@@ -67,9 +69,10 @@ Prints a full report with the following sections (in order):
 | `--since YYYY-MM-DD` | — | Start date (overrides `--days`) |
 | `--until YYYY-MM-DD` | now | End date (use with `--since`) |
 | `--stale-days N` | 90 | Mark assets stale if not updated in N days |
-| `--no-otel` | off | Skip OTel MTS dimension scan (faster) |
+| `--no-otel` | off | Skip OTel Dimension API scan (faster) |
 | `--no-teams` | off | Skip team rollup section |
 | `--csv` | off | Save user activity table to `reports/adoption_users_<ts>.csv` |
+| `--html` | off | Save full report as HTML to `reports/adoption_report_<ts>.html` |
 | `--json` | off | Save full raw data to `reports/adoption_report_<ts>.json` |
 
 ### `users` — user activity only
@@ -124,7 +127,22 @@ Example output:
   2026-04-06 05:38 UTC   PUT      /v2/token/_RLITHH7C8nIXRJOG4KYuQ
 ```
 
-## Example report output
+## HTML report
+
+```bash
+python3 o11y_adoption.py report --html
+# → reports/adoption_report_<timestamp>.html
+```
+
+Generates a self-contained single-file HTML report (no external dependencies, works offline) with:
+- Org health score with letter grade, full-width progress bar, and dimension cards
+- Platform overview stat cards
+- User activity table with inline per-user score bars (color-coded green/yellow/red)
+- OTel adoption — instrumented service count, collector status, language and SDK breakdown
+- Team rollup, detector health issues, token attribution, token alerts
+- Stale detector and dashboard tables
+
+## Example terminal output
 
 ```
   ORG HEALTH SCORE
@@ -132,7 +150,7 @@ Example output:
   Overall:  ██████████░░░░░░░░░░  49/100  (D)
 
   User adoption    ████████░░    19/25   7 of 9 users active in last 90d
-  OTel coverage    ░░░░░░░░░░     0/25   0 of 8 APM services OTel-instrumented
+  OTel coverage    ██████████    25/25   8 of 8 APM services OTel-instrumented
   Asset hygiene    ███░░░░░░░     7/25   51 of 182 detectors+dashboards not stale
   Token health     █████████░    23/25   20 of 22 tokens healthy
 
@@ -199,12 +217,16 @@ Grade: A ≥80, B ≥65, C ≥50, D ≥35, F <35
 
 ## OTel detection logic
 
-The tool scans MTS dimensions to infer OTel instrumentation coverage:
+OTel signals are detected via the **Dimension API** (`GET /v2/dimension`), not via MTS queries. The Splunk Java agent and OTel SDKs store instrumentation metadata as dimension-level properties, not as metric time series dimensions.
 
-- `telemetry.sdk.language` — OTel SDK present on that service
-- `telemetry.sdk.version` — OTel SDK version in use
-- `otelcol_*` metric prefix — OTel Collector deployment detected
-- Semantic convention metrics (`http.server.request.duration`, `jvm.memory.used`, etc.) — further OTel SDK signal
+| Signal | API query | What it means |
+|--------|-----------|---------------|
+| SDK languages in use | `key:telemetry.sdk.language` | Values: `java`, `python`, `go`, `nodejs`, etc. |
+| SDK names | `key:telemetry.sdk.name` | Values: `opentelemetry`, `beyla`, `opentelemetry-ebpf-instrumentation` |
+| OTel Collector present | `key:otelcol*` | Any result = Collector deployed |
+| Instrumented service count | APM topology node count | Services sending traces = instrumented |
+
+> **Why not MTS dimensions?** The Splunk Java agent and OTel SDKs attach `telemetry.sdk.*` as resource attributes on spans, not as dimensions on metric time series. Querying `/v2/metrictimeseries` for these keys returns zero results even in fully instrumented environments.
 
 ## Known limitations
 
