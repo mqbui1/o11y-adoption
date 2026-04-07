@@ -20,7 +20,9 @@ Audit tool for Splunk Observability Cloud adoption. Answers:
 | `GET /v2/dimension?query=key:telemetry.sdk.*` | OTel SDK language and version signals |
 | `GET /v2/dimension?query=key:telemetry.sdk.name` | OTel SDK name (opentelemetry, beyla, etc.) |
 | `GET /v2/dimension?query=key:otelcol*` | OTel Collector presence |
-| `POST /v2/apm/topology` | APM-instrumented service list |
+| `GET /v2/dimension?query=key:deployment.environment` | Deployment environments |
+| `GET /v2/dimension?query=key:service.name` | Per-service language (via `customProperties.telemetry.sdk.language`) |
+| `POST /v2/apm/topology` | APM service graph: nodes (real + inferred), edges (call relationships) |
 
 ## Setup
 
@@ -48,6 +50,7 @@ Prints a full report with the following sections (in order):
 | **Org health score** | 0–100 score with progress bars: user adoption, OTel coverage, asset hygiene, token health |
 | **Platform overview** | User counts, detector/dashboard/chart totals, token health summary |
 | **OTel & signal adoption** | APM service count, SDK-instrumented services, Collector deployments, language breakdown |
+| **Application insights** | Service inventory (name, language, call relationships), inferred dependencies (databases, external HTTP), deployment environments, stack type fingerprinting, hub services (most-called) |
 | **User activity table** | All users with engagement score (0–100), last login, last activity, login count, write ops |
 | **Login frequency timeline** | Logins per calendar week per user |
 | **Login heatmap** | Org-wide logins by day-of-week × hour-of-day (UTC) |
@@ -59,6 +62,7 @@ Prints a full report with the following sections (in order):
 | **Inactive users** | Users with no login or write activity in the lookback window |
 | **Token alerts** | Expired and soon-to-expire tokens |
 | **Stale detectors** | Detectors not updated in `--stale-days` |
+| **Application insights** | Service inventory by type/language, dependency graph, inferred deps (databases, external HTTP), environment breakdown, stack type fingerprinting |
 | **Stale dashboards** | Dashboards not updated in `--stale-days` |
 
 **Options:**
@@ -154,6 +158,28 @@ Generates a self-contained single-file HTML report (no external dependencies, wo
   Asset hygiene    ███░░░░░░░     7/25   51 of 182 detectors+dashboards not stale
   Token health     █████████░    23/25   20 of 22 tokens healthy
 
+  APPLICATION INSIGHTS
+  ──────────────────────────────────────────────────────────────────────────
+  Environments:    production, staging
+  Stack types:     Java microservices, 1 database(s) detected
+  Languages:       java (6), python (1)
+
+  Services (8):
+    admin-server                        [java]
+    api-gateway                         [java]  ★ hub
+    config-server                       [java]
+    customers-service                   [java]
+    discovery-server                    [java]
+    vets-service                        [java]
+    visits-service                      [java]
+    worker-service                      [python]
+
+  Inferred dependencies:
+    mysql:petclinic                     [database]
+
+  Most-depended-upon services:
+    api-gateway                           called by 3 service(s), calls 4
+
   USER ACTIVITY  (last 90 days)
   ──────────────────────────────────────────────────────────────────────────
   User                                 Score  Last Login             Logins  Writes
@@ -227,6 +253,27 @@ OTel signals are detected via the **Dimension API** (`GET /v2/dimension`), not v
 | Instrumented service count | APM topology node count | Services sending traces = instrumented |
 
 > **Why not MTS dimensions?** The Splunk Java agent and OTel SDKs attach `telemetry.sdk.*` as resource attributes on spans, not as dimensions on metric time series. Querying `/v2/metrictimeseries` for these keys returns zero results even in fully instrumented environments.
+
+## Application insights
+
+The `report` command includes an **Application Insights** section that answers "what types of applications are being onboarded?" using three data sources:
+
+| Signal | API | What it shows |
+|--------|-----|---------------|
+| Service inventory | `POST /v2/apm/topology` | All instrumented services (real) + inferred dependencies (databases, external HTTP) |
+| Per-service language | `GET /v2/dimension?query=key:service.name` | `customProperties.telemetry.sdk.language` on each service dimension |
+| Environments | `GET /v2/dimension?query=key:deployment.environment` | All deployment environments (production, staging, dev, etc.) |
+| Dependency graph | APM topology edges | Which services call which — used to identify hub/gateway services |
+
+### What it detects
+
+| Insight | How |
+|---------|-----|
+| **Stack type** | Infers "Java microservices", "Python services", "Node.js services", etc. from language distribution + service count |
+| **Database dependencies** | APM topology inferred nodes with `type=database` — shows name (e.g. `mysql:petclinic`) |
+| **Hub services** | Services with highest in-degree (most called by others) — likely API gateways or shared libs |
+| **Environments** | Dimension API returns all `deployment.environment` values seen in traces |
+| **Language per service** | Cross-references `service.name` dimension `customProperties` for `telemetry.sdk.language` |
 
 ## Known limitations
 
