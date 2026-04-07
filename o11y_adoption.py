@@ -267,6 +267,9 @@ def analyze_users(members, session_events, http_events, days=90):
     return users
 
 
+
+
+
 def analyze_asset_ownership(detectors, dashboards, charts, members):
     """
     Build a map of user -> assets they own/last-modified.
@@ -354,6 +357,103 @@ def analyze_assets(detectors, dashboards, charts, tokens, stale_days=90):
     }
 
 
+def score_user_engagement(user, ownership, days):
+    """
+    Compute a 0–100 engagement score for a single user.
+
+    Components (each capped, then weighted):
+      - Recency        (30pts): days since last activity, linear decay
+      - Login cadence  (25pts): logins over the window vs expected weekly cadence
+      - Write activity (25pts): write ops (log scale, caps at 50 ops = full score)
+      - Asset footprint(20pts): detectors + dashboards + charts owned (log scale)
+    """
+    import math
+
+    score = 0
+
+    # Recency (30pts): full score if active today, 0 if no activity or >days ago
+    if user["last_activity"]:
+        now_ms     = time.time() * 1000
+        days_since = (now_ms - user["last_activity"]) / (86400 * 1000)
+        recency    = max(0.0, 1.0 - days_since / days)
+        score     += recency * 30
+
+    # Login cadence (25pts): target = at least 1 login/week over the window
+    weeks        = max(days / 7, 1)
+    target_logins = weeks  # one per week = full cadence
+    cadence       = min(user["login_count"] / target_logins, 1.0)
+    score        += cadence * 25
+
+    # Write activity (25pts): log scale, 50 ops = full score
+    if user["write_ops"] > 0:
+        write_score = min(math.log10(user["write_ops"] + 1) / math.log10(51), 1.0)
+        score      += write_score * 25
+
+    # Asset footprint (20pts): log scale, 20 assets = full score
+    email = user["email"]
+    owned = ownership.get(email, {})
+    n_assets = (len(owned.get("detectors", [])) +
+                len(owned.get("dashboards", [])) +
+                len(owned.get("charts", [])))
+    if n_assets > 0:
+        asset_score = min(math.log10(n_assets + 1) / math.log10(21), 1.0)
+        score      += asset_score * 20
+
+    return round(score)
+
+
+def score_bar(score, width=20):
+    """Return a text progress bar for a 0–100 score."""
+    filled = round(score / 100 * width)
+    bar    = "█" * filled + "░" * (width - filled)
+    return bar
+
+
+def compute_org_health(users, assets, otel, days):
+    """
+    Compute a 0–100 org health score with sub-scores across four dimensions.
+
+    Dimensions:
+      - User adoption    (25pts): active users / total users
+      - OTel coverage    (25pts): SDK-instrumented / total APM services
+      - Asset hygiene    (25pts): non-stale assets / total assets (detectors + dashboards)
+      - Token health     (25pts): non-expired/expiring tokens / total tokens
+    """
+    scores = {}
+
+    # User adoption
+    total_users  = len(users)
+    active_users = sum(1 for u in users if u["active"])
+    scores["user_adoption"] = round((active_users / total_users * 25) if total_users else 0, 1)
+
+    # OTel coverage
+    apm_total = otel["apm_count"]
+    sdk_count = otel["sdk_count"]
+    scores["otel_coverage"] = round((sdk_count / apm_total * 25) if apm_total else 0, 1)
+
+    # Asset hygiene: (active det + active dash) / (total det + total dash)
+    total_assets  = assets["detectors"]["total"] + assets["dashboards"]["total"]
+    stale_assets  = assets["detectors"]["stale"] + assets["dashboards"]["stale"]
+    active_assets = total_assets - stale_assets
+    scores["asset_hygiene"] = round((active_assets / total_assets * 25) if total_assets else 25, 1)
+
+    # Token health: penalise expired + expiring <7d
+    total_tokens   = assets["tokens"]["total"]
+    unhealthy_toks = assets["tokens"]["expired"] + assets["tokens"]["expiring_7d"]
+    healthy_toks   = max(total_tokens - unhealthy_toks, 0)
+    scores["token_health"] = round((healthy_toks / total_tokens * 25) if total_tokens else 25, 1)
+
+    scores["total"] = round(sum(scores[k] for k in
+                                ["user_adoption", "otel_coverage", "asset_hygiene", "token_health"]))
+    scores["details"] = {
+        "active_users": active_users, "total_users": total_users,
+        "sdk_services": sdk_count,    "apm_services": apm_total,
+        "active_assets": active_assets, "total_assets": total_assets,
+        "healthy_tokens": healthy_toks, "total_tokens": total_tokens,
+    }
+    return scores
+
+
 def analyze_otel(otel_services, apm_services):
     apm_names   = {s["serviceName"] for s in apm_services}
     sdk_svcs    = {s for s, info in otel_services.items() if info["sdk"]}
@@ -387,14 +487,33 @@ def print_report(members, session_events, http_events,
     assets       = analyze_assets(detectors, dashboards, charts, tokens, stale_days)
     otel         = analyze_otel(otel_services, apm_services)
     ownership    = analyze_asset_ownership(detectors, dashboards, charts, members)
+    org_health   = compute_org_health(users, assets, otel, days)
     now_str      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     width        = 110
+
+    # Add engagement score to each user
+    for u in users:
+        u["engagement_score"] = score_user_engagement(u, ownership, days)
 
     print()
     print("=" * width)
     print(f"  Splunk Observability Adoption Report  |  realm={REALM}  |  {now_str}")
     print(f"  Activity window: last {days} days  |  Stale threshold: >{stale_days} days since last update")
     print("=" * width)
+
+    # ── Org health score ──────────────────────────────────────────────────
+    total        = org_health["total"]
+    d            = org_health["details"]
+    grade        = "A" if total >= 80 else "B" if total >= 65 else "C" if total >= 50 else "D" if total >= 35 else "F"
+    print(f"""
+  ORG HEALTH SCORE
+  {"─" * 50}
+  Overall:  {score_bar(total)}  {total}/100  ({grade})
+
+  User adoption    {score_bar(org_health['user_adoption'] * 4, 10)}  {org_health['user_adoption']:>4.0f}/25   {d['active_users']} of {d['total_users']} users active in last {days}d
+  OTel coverage    {score_bar(org_health['otel_coverage']  * 4, 10)}  {org_health['otel_coverage']:>4.0f}/25   {d['sdk_services']} of {d['apm_services']} APM services OTel-instrumented
+  Asset hygiene    {score_bar(org_health['asset_hygiene']  * 4, 10)}  {org_health['asset_hygiene']:>4.0f}/25   {d['active_assets']} of {d['total_assets']} detectors+dashboards not stale
+  Token health     {score_bar(org_health['token_health']   * 4, 10)}  {org_health['token_health']:>4.0f}/25   {d['healthy_tokens']} of {d['total_tokens']} tokens healthy""")
 
     # ── Platform summary ──────────────────────────────────────────────────
     active_users  = [u for u in users if u["active"]]
@@ -429,19 +548,19 @@ def print_report(members, session_events, http_events,
     print(f"""
   USER ACTIVITY  (last {days} days)
   {"─" * width}
-  {"User":<35} {"Last Login":<22} {"Last Activity":<22} {"Logins":>7} {"API Calls":>10} {"Writes":>7}  {"Auth Method":<20} {"Resources Used"}""")
+  {"User":<35} {"Score":>6}  {"Last Login":<22} {"Last Activity":<22} {"Logins":>7} {"Writes":>7}  {"Resources Used"}""")
     print("  " + "-" * (width - 2))
 
     for u in users:
         last_login    = ts_to_str(u["last_login"])    if u["last_login"]    else "never"
         last_activity = ts_to_str(u["last_activity"]) if u["last_activity"] else "never"
-        auth          = ", ".join(u["auth_methods"][:2]) or "—"
         resources     = ", ".join(u["resources_used"][:4]) + ("..." if len(u["resources_used"]) > 4 else "")
         admin_tag     = " [admin]" if u["admin"] else ""
         name          = f"{u['email']}{admin_tag}"
-        print(f"  {name:<35} {last_login:<22} {last_activity:<22} "
-              f"{u['login_count']:>7} {u['http_count']:>10} {u['write_ops']:>7}  "
-              f"{auth:<20} {resources or '—'}")
+        sc            = u["engagement_score"]
+        score_str     = f"{sc:>3}/100"
+        print(f"  {name:<35} {score_str}  {last_login:<22} {last_activity:<22} "
+              f"{u['login_count']:>7} {u['write_ops']:>7}  {resources or '—'}")
 
     # ── Login frequency timeline ──────────────────────────────────────────
     active_with_logins = [u for u in users if u["logins_per_week"]]
