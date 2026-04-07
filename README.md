@@ -42,9 +42,10 @@ Prints a full report with the following sections:
 
 | Section | What it shows |
 |---------|---------------|
+| **Org health score** | Single 0–100 score with progress bars across four dimensions: user adoption, OTel coverage, asset hygiene, token health |
 | **Platform overview** | User counts, detector/dashboard/chart totals, token health summary |
 | **OTel & signal adoption** | APM service count, SDK-instrumented services, Collector deployments, language breakdown |
-| **User activity table** | All users sorted by recency: last login, last activity, login count, API calls, write ops, auth method, resource types |
+| **User activity table** | All users with engagement score (0–100), last login, last activity, login count, write ops, resource types |
 | **Login frequency timeline** | Logins per calendar week per user — shows engagement trends over time |
 | **Login heatmap** | Org-wide logins by day-of-week × hour-of-day (UTC) — reveals usage patterns and timezone concentration |
 | **Write activity detail** | Per-user breakdown of API mutations: grouped by method+resource type, plus 5 most recent individual operations with timestamps and URIs |
@@ -86,6 +87,23 @@ Lists all tokens with expiry status and auth scopes. Flags expired and expiring-
 ## Example output
 
 ```
+  ORG HEALTH SCORE
+  ──────────────────────────────────────────────────
+  Overall:  ██████████░░░░░░░░░░  49/100  (D)
+
+  User adoption    ████████░░    19/25   7 of 9 users active in last 90d
+  OTel coverage    ░░░░░░░░░░     0/25   0 of 8 APM services OTel-instrumented
+  Asset hygiene    ███░░░░░░░     7/25   51 of 182 detectors+dashboards not stale
+  Token health     █████████░    23/25   20 of 22 tokens healthy
+
+  USER ACTIVITY  (last 90 days)
+  ──────────────────────────────────────────────────────────────────────────
+  User                                 Score  Last Login           Logins  Writes
+  ──────────────────────────────────────────────────────────────────────────
+  mbui@splunk.com [admin]              92/100  2026-03-25 03:37          9      46
+  gravi@splunk.com                     32/100  2026-03-11 18:20          3       0
+  agrover@splunk.com [admin]            5/100  never                     0       0
+
   LOGIN FREQUENCY  (logins per calendar week)
   ─────────────────────────────────────────────────────────────────
   User                                 W01  W02  W08  W09  W10  W11  W12
@@ -120,6 +138,28 @@ Lists all tokens with expiry status and auth scopes. Flags expired and expiring-
   mbui@splunk.com                                   4          35     222
   adiaz@splunk.com                                  0           1       0
 ```
+
+## Scoring
+
+### Org health score (0–100)
+
+| Dimension | Weight | Formula |
+|-----------|--------|---------|
+| User adoption | 25 pts | `active users / total users` |
+| OTel coverage | 25 pts | `SDK-instrumented services / total APM services` |
+| Asset hygiene | 25 pts | `non-stale assets / total detectors+dashboards` |
+| Token health  | 25 pts | `healthy tokens / total tokens` (penalises expired + expiring <7d) |
+
+Grade: A ≥80, B ≥65, C ≥50, D ≥35, F <35
+
+### User engagement score (0–100)
+
+| Component | Weight | Formula |
+|-----------|--------|---------|
+| Recency | 30 pts | Linear decay from last activity date to window start |
+| Login cadence | 25 pts | Actual logins vs target of 1/week over the window |
+| Write activity | 25 pts | Log scale — 50 write ops = full score |
+| Asset footprint | 20 pts | Log scale — 20 owned assets = full score |
 
 ## What counts as "active"
 
