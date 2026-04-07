@@ -555,7 +555,7 @@ def analyze_app_insights(apm_nodes, apm_edges, otel_signals, svc_lang_map, envir
     # Fall back to org-wide language signals if per-service map is sparse
     if not lang_counts and otel_signals.get("languages"):
         for lang in otel_signals["languages"]:
-            lang_counts[lang] = 0  # count unknown but present
+            lang_counts[lang] = 1  # present org-wide, count unknown per-service
 
     # Stack type fingerprinting
     stack_types = []
@@ -1172,7 +1172,8 @@ def print_report(members, session_events, http_events,
         if ai["inferred_deps"]:
             dep_parts = []
             for dtype, cnt in sorted(ai["inferred_dep_types"].items()):
-                dep_parts.append(f"{cnt} {dtype}(s)")
+                label = "inferred HTTP endpoint(s)" if dtype == "service" else f"{dtype}(s)"
+                dep_parts.append(f"{cnt} {label}")
             print(f"\n  Inferred dependencies:  {', '.join(dep_parts)}")
             for n in sorted(ai["inferred_deps"], key=lambda x: x.get("serviceName", "")):
                 print(f"    {n.get('serviceName', '?'):<35}  [{n.get('type','unknown')}]")
