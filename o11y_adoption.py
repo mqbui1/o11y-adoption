@@ -161,6 +161,53 @@ def fetch_deployment_environments():
         return []
 
 
+def fetch_services_per_environment(environments):
+    """
+    Query APM topology per environment to build a service -> [envs] map.
+    Skips workshop envs to keep it fast (they all share the same service set).
+    Returns dict: {service_name: [env, ...]}
+    """
+    import time
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    week_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 604800))
+
+    svc_envs = defaultdict(set)
+    # Only query non-workshop envs to avoid N*26 API calls
+    non_workshop = [e for e in environments if not e.endswith("-workshop")]
+    workshop_envs = [e for e in environments if e.endswith("-workshop")]
+
+    for env in non_workshop:
+        try:
+            r = requests.post(f"{API_BASE}/v2/apm/topology",
+                              headers=HDR,
+                              json={"timeRange": f"{week_ago}/{now}", "environmentName": env},
+                              timeout=15)
+            nodes = (r.json().get("data") or {}).get("nodes", [])
+            for n in nodes:
+                if not n.get("inferred"):
+                    svc_envs[n["serviceName"]].add(env)
+        except Exception:
+            continue
+
+    # Sample one workshop env to check if services are the same
+    if workshop_envs:
+        try:
+            sample_env = workshop_envs[0]
+            r = requests.post(f"{API_BASE}/v2/apm/topology",
+                              headers=HDR,
+                              json={"timeRange": f"{week_ago}/{now}", "environmentName": sample_env},
+                              timeout=15)
+            nodes = (r.json().get("data") or {}).get("nodes", [])
+            workshop_svcs = {n["serviceName"] for n in nodes if not n.get("inferred")}
+            # Check if all workshop envs share same services as sampled env
+            for svc in workshop_svcs:
+                svc_envs[svc].add(f"workshop ({len(workshop_envs)} envs)")
+        except Exception:
+            pass
+
+    return {svc: sorted(envs) for svc, envs in svc_envs.items()}
+
+
 def fetch_service_languages():
     """
     Per-service language mapping is not available via dimension or MTS APIs
@@ -487,7 +534,7 @@ def analyze_otel(otel_signals, apm_services):
     }
 
 
-def analyze_app_insights(apm_nodes, apm_edges, otel_signals, svc_lang_map, environments):
+def analyze_app_insights(apm_nodes, apm_edges, otel_signals, svc_lang_map, environments, svc_envs=None):
     """
     Derive application onboarding insights from APM topology and dimension data.
 
@@ -592,6 +639,7 @@ def analyze_app_insights(apm_nodes, apm_edges, otel_signals, svc_lang_map, envir
         "environments":       environments,
         "env_categories":     env_categories,
         "stack_types":        stack_types,
+        "svc_envs":           svc_envs or {},
     }
 
 
@@ -694,16 +742,28 @@ def _html_app_insights(ai):
     if not ai:
         return ""
 
-    # Service rows — sorted by in-degree (most called first)
+    # Service rows — with environments
+    svc_envs_map = ai.get("svc_envs", {})
     svc_rows = ""
-    for s in sorted(ai["services"], key=lambda x: -ai["in_degree"].get(x["name"], 0)):
-        hub = "★ " if s["name"] in ai["hub_services"][:3] and ai["in_degree"].get(s["name"], 0) > 0 else ""
-        callers = ai["in_degree"].get(s["name"], 0)
-        callees = ai["out_degree"].get(s["name"], 0)
-        hub_style = "font-weight:700" if hub else ""
-        svc_rows += (f'<tr><td style="{hub_style}">{hub}{s["name"]}</td>'
-                     f'<td style="text-align:center">{callers}</td>'
-                     f'<td style="text-align:center">{callees}</td></tr>')
+    for s in sorted(ai["services"], key=lambda x: x["name"]):
+        envs = svc_envs_map.get(s["name"], [])
+        env_badges = ""
+        for env in envs:
+            if env.startswith("workshop"):
+                color = "#d97706"
+            elif env in ("production", "prod"):
+                color = "#16a34a"
+            elif env in ("staging", "stage"):
+                color = "#2563eb"
+            elif env in ("dev", "development"):
+                color = "#7c3aed"
+            else:
+                color = "#64748b"
+            env_badges += (f'<span style="background:{color};color:#fff;padding:1px 6px;'
+                           f'border-radius:8px;font-size:11px;margin:1px;display:inline-block">'
+                           f'{env}</span>')
+        svc_rows += (f'<tr><td>{s["name"]}</td>'
+                     f'<td>{env_badges if env_badges else "—"}</td></tr>')
 
     # Inferred dep rows
     dep_rows = ""
@@ -770,7 +830,7 @@ def _html_app_insights(ai):
         <b style="font-size:12px;color:#64748b">ENVIRONMENTS ({len(ai['environments'])} total)</b>
         <div style="margin-top:8px">{env_section}</div>
       </div>
-      {'<div style="flex:1;min-width:240px"><b style="font-size:12px;color:#64748b">SERVICES</b><table style="margin-top:8px"><thead><tr><th>Service</th><th style="text-align:center">Called By</th><th style="text-align:center">Calls</th></tr></thead><tbody>' + svc_rows + '</tbody></table></div>' if svc_rows else ''}
+      {'<div style="flex:2;min-width:300px"><b style="font-size:12px;color:#64748b">SERVICES</b><table style="margin-top:8px"><thead><tr><th>Service</th><th>Environments</th></tr></thead><tbody>' + svc_rows + '</tbody></table></div>' if svc_rows else ''}
       {'<div style="flex:1;min-width:180px"><b style="font-size:12px;color:#64748b">INFERRED DEPENDENCIES</b><table style="margin-top:8px"><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>' + dep_rows + '</tbody></table></div>' if dep_rows else ''}
     </div>
   </div>"""
@@ -1099,7 +1159,8 @@ def print_report(members, session_events, http_events,
                  detectors, dashboards, charts, tokens,
                  otel_services, apm_services, teams=None,
                  days=90, stale_days=90, csv_path=None, html_path=None,
-                 apm_nodes=None, apm_edges=None, environments=None, svc_lang_map=None):
+                 apm_nodes=None, apm_edges=None, environments=None, svc_lang_map=None,
+                 svc_envs=None):
 
     users        = analyze_users(members, session_events, http_events, days)
     assets       = analyze_assets(detectors, dashboards, charts, tokens, stale_days)
@@ -1110,7 +1171,7 @@ def print_report(members, session_events, http_events,
     tok_attr     = analyze_token_attribution(session_events, members, tokens)
     app_insights = analyze_app_insights(
         apm_nodes or apm_services, apm_edges or [], otel_services,
-        svc_lang_map or {}, environments or []
+        svc_lang_map or {}, environments or [], svc_envs=svc_envs or {}
     )
     now_str      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     width        = 110
@@ -1198,16 +1259,16 @@ def print_report(members, session_events, http_events,
         if ai["language_breakdown"]:
             lang_parts = [f"{lang}" for lang in sorted(ai["language_breakdown"].keys())]
             print(f"  Languages:       {', '.join(lang_parts)}  (org-wide)")
-        # Service inventory with call counts
+        # Service inventory with environments
         if ai["services"]:
+            svc_envs_map = ai["svc_envs"]
             print(f"\n  Services ({ai['service_count']}):")
-            print(f"    {'Name':<35} {'Called by':>9} {'Calls':>6}")
-            print(f"    {'─'*52}")
-            for s in sorted(ai["services"], key=lambda x: -ai["in_degree"].get(x["name"], 0)):
-                hub_tag  = " ★" if s["name"] in ai["hub_services"][:3] and ai["in_degree"].get(s["name"], 0) > 0 else ""
-                callers  = ai["in_degree"].get(s["name"], 0)
-                callees  = ai["out_degree"].get(s["name"], 0)
-                print(f"    {s['name']:<35} {callers:>9} {callees:>6}{hub_tag}")
+            print(f"    {'Name':<35}  Environments")
+            print(f"    {'─'*80}")
+            for s in sorted(ai["services"], key=lambda x: x["name"]):
+                envs = svc_envs_map.get(s["name"], [])
+                env_str = ", ".join(envs) if envs else "—"
+                print(f"    {s['name']:<35}  {env_str}")
         # Inferred dependencies
         if ai["inferred_deps"]:
             dep_parts = []
@@ -1536,6 +1597,7 @@ def main():
         apm_edges     = []
         environments  = []
         svc_lang_map  = {}
+        svc_envs      = {}
         if not args.no_otel:
             print("  OTel dimensions...")
             otel_services = fetch_otel_signals()
@@ -1544,8 +1606,8 @@ def main():
             apm_services = [n for n in apm_nodes if not n.get("inferred")]
             print("  Deployment environments...")
             environments = fetch_deployment_environments()
-            print("  Per-service languages...")
-            svc_lang_map = fetch_service_languages()
+            print("  Services per environment...")
+            svc_envs = fetch_services_per_environment(environments)
 
         teams = []
         if not args.no_teams:
@@ -1559,7 +1621,8 @@ def main():
                      csv_path=True if args.csv else None,
                      html_path=True if args.html else None,
                      apm_nodes=apm_nodes, apm_edges=apm_edges,
-                     environments=environments, svc_lang_map=svc_lang_map)
+                     environments=environments, svc_lang_map=svc_lang_map,
+                     svc_envs=svc_envs)
 
         if args.json:
             path = save_json({
