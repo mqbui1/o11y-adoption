@@ -579,6 +579,281 @@ def analyze_token_attribution(session_events, members, tokens):
     return results
 
 
+def save_html(users, assets, otel, ownership, org_health, team_data,
+              det_issues, tok_attr, detectors, dashboards, tokens,
+              days, stale_days, realm, path=None):
+    REPORTS_DIR.mkdir(exist_ok=True)
+    ts_str   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path     = path or REPORTS_DIR / f"adoption_report_{ts_str}.html"
+    now_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    d        = org_health["details"]
+    total    = org_health["total"]
+    grade    = "A" if total >= 80 else "B" if total >= 65 else "C" if total >= 50 else "D" if total >= 35 else "F"
+    grade_color = {"A": "#22c55e", "B": "#84cc16", "C": "#eab308", "D": "#f97316", "F": "#ef4444"}[grade]
+
+    def pct(n, d_): return round(n / d_ * 100) if d_ else 0
+    def score_color(s):
+        if s >= 70: return "#22c55e"
+        if s >= 40: return "#eab308"
+        return "#ef4444"
+    def flag_badge(f):
+        colors = {"no-notifications": "#f97316", "disabled": "#ef4444", "muted": "#6366f1"}
+        c = colors.get(f, "#94a3b8")
+        return f'<span style="background:{c};color:#fff;padding:2px 7px;border-radius:9px;font-size:11px;margin-right:3px">{f}</span>'
+    def bar(val, maxv=100, color="#3b82f6", height=6):
+        w = min(round(val / maxv * 100), 100)
+        return (f'<div style="background:#e2e8f0;border-radius:3px;height:{height}px;width:120px;display:inline-block;vertical-align:middle">'
+                f'<div style="background:{color};width:{w}%;height:100%;border-radius:3px"></div></div>')
+
+    # ── User rows ─────────────────────────────────────────────────────────
+    user_rows = ""
+    for u in users:
+        sc   = u.get("engagement_score", 0)
+        sc_c = score_color(sc)
+        ll   = ts_to_str(u["last_login"])    if u["last_login"]    else "never"
+        la   = ts_to_str(u["last_activity"]) if u["last_activity"] else "never"
+        tag  = " <small style='color:#94a3b8'>[admin]</small>" if u["admin"] else ""
+        own  = ownership.get(u["email"], {})
+        n_det  = len(own.get("detectors",  []))
+        n_dash = len(own.get("dashboards", []))
+        n_ch   = len(own.get("charts",     []))
+        user_rows += f"""
+        <tr>
+          <td>{u['email']}{tag}</td>
+          <td style="text-align:center">
+            <span style="font-weight:700;color:{sc_c}">{sc}</span><small>/100</small><br>
+            {bar(sc, color=sc_c, height=4)}
+          </td>
+          <td>{ll}</td>
+          <td>{la}</td>
+          <td style="text-align:center">{u['login_count']}</td>
+          <td style="text-align:center">{u['write_ops']}</td>
+          <td style="text-align:center">{n_det}</td>
+          <td style="text-align:center">{n_dash}</td>
+          <td style="text-align:center">{n_ch}</td>
+        </tr>"""
+
+    # ── Team rows ─────────────────────────────────────────────────────────
+    team_rows = ""
+    for t in team_data:
+        sc_c = score_color(t["avg_score"])
+        team_rows += f"""
+        <tr>
+          <td>{t['name']}</td>
+          <td style="text-align:center">{t['member_count']}</td>
+          <td style="text-align:center">{t['active']}</td>
+          <td style="text-align:center">
+            <span style="font-weight:700;color:{sc_c}">{t['avg_score']}</span>/100
+          </td>
+          <td style="text-align:center">{t['logins']}</td>
+          <td style="text-align:center">{t['writes']}</td>
+          <td style="text-align:center">{t['detectors']}</td>
+          <td style="text-align:center">{t['dashboards']}</td>
+          <td style="text-align:center">{t['charts']}</td>
+        </tr>"""
+
+    # ── Detector issue rows ───────────────────────────────────────────────
+    det_rows = ""
+    for dd in sorted(det_issues, key=lambda x: x.get("lastUpdated") or 0, reverse=True)[:30]:
+        badges = "".join(flag_badge(f) for f in dd["flags"])
+        det_rows += f"""
+        <tr>
+          <td>{dd['name']}</td>
+          <td>{ts_to_str(dd['lastUpdated'])}</td>
+          <td>{badges}</td>
+        </tr>"""
+
+    # ── Token attribution rows ────────────────────────────────────────────
+    tok_rows = ""
+    for t in tok_attr:
+        shared = '<span style="background:#ef4444;color:#fff;padding:2px 7px;border-radius:9px;font-size:11px">SHARED</span>' if t["shared"] else ""
+        tok_rows += f"""
+        <tr>
+          <td>{t['token_name']}</td>
+          <td>{t['scopes']}</td>
+          <td style="text-align:center">{t['user_count']}</td>
+          <td>{', '.join(t['emails'])}{' ' + shared if shared else ''}</td>
+        </tr>"""
+
+    # ── Stale asset rows ──────────────────────────────────────────────────
+    now_ms   = int(time.time() * 1000)
+    stale_ms = stale_days * 86400 * 1000
+    stale_det_rows  = ""
+    for dd in sorted([d for d in detectors  if (now_ms - (d.get("lastUpdated") or 0)) > stale_ms],
+                     key=lambda x: x.get("lastUpdated", 0))[:20]:
+        stale_det_rows += f"<tr><td>{dd['name']}</td><td>{ts_to_str(dd.get('lastUpdated'))}</td><td>{dd.get('lastUpdatedBy','—')}</td></tr>"
+    stale_dash_rows = ""
+    for dd in sorted([d for d in dashboards if (now_ms - (d.get("lastUpdated") or 0)) > stale_ms],
+                     key=lambda x: x.get("lastUpdated", 0))[:20]:
+        stale_dash_rows += f"<tr><td>{dd['name']}</td><td>{ts_to_str(dd.get('lastUpdated'))}</td><td>{dd.get('lastUpdatedBy','—')}</td></tr>"
+
+    # ── Token alert rows ──────────────────────────────────────────────────
+    tok_alert_rows = ""
+    now_s = time.time()
+    for t in assets["tokens"]["expired_list"]:
+        tok_alert_rows += f'<tr><td>{t["name"]}</td><td><span style="color:#ef4444;font-weight:700">EXPIRED</span></td><td>{ts_to_str(t.get("expiry"))}</td></tr>'
+    for t in assets["tokens"]["expiring_7d_list"]:
+        dl = int((t.get("expiry", 0) / 1000 - now_s) / 86400)
+        tok_alert_rows += f'<tr><td>{t["name"]}</td><td><span style="color:#f97316;font-weight:700">EXPIRING {dl}d</span></td><td>{ts_to_str(t.get("expiry"))}</td></tr>'
+    for t in assets["tokens"]["expiring_30d_list"]:
+        dl = int((t.get("expiry", 0) / 1000 - now_s) / 86400)
+        tok_alert_rows += f'<tr><td>{t["name"]}</td><td><span style="color:#eab308;font-weight:700">expiring {dl}d</span></td><td>{ts_to_str(t.get("expiry"))}</td></tr>'
+
+    # ── OTel rows ─────────────────────────────────────────────────────────
+    otel_lang_rows = ""
+    for lang, svcs in sorted(otel.get("languages", {}).items()):
+        otel_lang_rows += f"<tr><td>{lang}</td><td>{len(svcs)}</td><td>{', '.join(svcs[:6])}{'...' if len(svcs) > 6 else ''}</td></tr>"
+
+    def dim_card(label, val, maxv, color, detail=""):
+        p = pct(val, maxv)
+        return f"""
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px;flex:1;min-width:180px">
+          <div style="font-size:12px;color:#64748b;margin-bottom:4px">{label}</div>
+          <div style="font-size:22px;font-weight:700;color:{color}">{val}<span style="font-size:13px;color:#94a3b8">/{maxv}</span></div>
+          <div style="background:#e2e8f0;border-radius:4px;height:8px;margin:8px 0">
+            <div style="background:{color};width:{p}%;height:100%;border-radius:4px"></div>
+          </div>
+          <div style="font-size:11px;color:#64748b">{detail}</div>
+        </div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Splunk O11y Adoption Report — {realm}</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #f1f5f9; color: #1e293b; font-size: 14px; }}
+    .page {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
+    header {{ background: linear-gradient(135deg,#0f172a,#1e3a5f);
+              color: #fff; border-radius: 12px; padding: 28px 32px; margin-bottom: 24px; }}
+    header h1 {{ font-size: 22px; font-weight: 700; margin-bottom: 6px; }}
+    header p  {{ font-size: 13px; color: #94a3b8; }}
+    .card {{ background: #fff; border-radius: 12px; border: 1px solid #e2e8f0;
+             padding: 24px; margin-bottom: 20px; }}
+    .card h2 {{ font-size: 14px; font-weight: 700; text-transform: uppercase;
+                letter-spacing: .05em; color: #64748b; margin-bottom: 16px;
+                padding-bottom: 10px; border-bottom: 1px solid #f1f5f9; }}
+    .stat-grid {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 4px; }}
+    .stat {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;
+             padding:14px 20px; text-align:center; min-width:120px; }}
+    .stat .val {{ font-size:28px; font-weight:800; color:#1e293b; }}
+    .stat .lbl {{ font-size:11px; color:#94a3b8; margin-top:2px; }}
+    table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+    th {{ background:#f8fafc; color:#64748b; font-size:11px; font-weight:600;
+          text-transform:uppercase; letter-spacing:.05em;
+          padding:8px 12px; text-align:left; border-bottom:2px solid #e2e8f0; }}
+    td {{ padding:9px 12px; border-bottom:1px solid #f1f5f9; vertical-align:middle; }}
+    tr:last-child td {{ border-bottom:none; }}
+    tr:hover td {{ background:#f8fafc; }}
+    .big-score {{ font-size:52px; font-weight:900; color:{grade_color}; line-height:1; }}
+    .grade {{ display:inline-block; background:{grade_color}; color:#fff;
+              font-size:24px; font-weight:900; width:48px; height:48px;
+              border-radius:50%; text-align:center; line-height:48px; margin-left:12px; }}
+    .dim-row {{ display:flex; gap:12px; flex-wrap:wrap; }}
+    .section-note {{ font-size:12px; color:#94a3b8; margin-top:12px; font-style:italic; }}
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <h1>Splunk Observability Cloud — Adoption Report</h1>
+    <p>realm={realm} &nbsp;|&nbsp; generated {now_str} &nbsp;|&nbsp; activity window: last {days} days</p>
+  </header>
+
+  <!-- ORG HEALTH SCORE -->
+  <div class="card">
+    <h2>Org Health Score</h2>
+    <div style="display:flex;align-items:center;gap:24px;margin-bottom:24px">
+      <div>
+        <span class="big-score">{total}</span><span style="font-size:20px;color:#94a3b8">/100</span>
+        <span class="grade">{grade}</span>
+      </div>
+      <div style="flex:1;background:#e2e8f0;border-radius:6px;height:14px">
+        <div style="background:{grade_color};width:{total}%;height:100%;border-radius:6px;transition:width .3s"></div>
+      </div>
+    </div>
+    <div class="dim-row">
+      {dim_card("User Adoption",  round(org_health['user_adoption']),  25, "#3b82f6",
+                f"{d['active_users']} of {d['total_users']} users active")}
+      {dim_card("OTel Coverage",  round(org_health['otel_coverage']),  25, "#8b5cf6",
+                f"{d['sdk_services']} of {d['apm_services']} APM services instrumented")}
+      {dim_card("Asset Hygiene",  round(org_health['asset_hygiene']),  25, "#10b981",
+                f"{d['active_assets']} of {d['total_assets']} assets not stale")}
+      {dim_card("Token Health",   round(org_health['token_health']),   25, "#f59e0b",
+                f"{d['healthy_tokens']} of {d['total_tokens']} tokens healthy")}
+    </div>
+  </div>
+
+  <!-- PLATFORM OVERVIEW -->
+  <div class="card">
+    <h2>Platform Overview</h2>
+    <div class="stat-grid">
+      <div class="stat"><div class="val">{len([u for u in users if u['active']])}</div><div class="lbl">Active Users</div></div>
+      <div class="stat"><div class="val">{len(users)}</div><div class="lbl">Total Users</div></div>
+      <div class="stat"><div class="val">{assets['detectors']['total']}</div><div class="lbl">Detectors</div></div>
+      <div class="stat"><div class="val">{assets['dashboards']['total']}</div><div class="lbl">Dashboards</div></div>
+      <div class="stat"><div class="val">{assets['charts']['total']}</div><div class="lbl">Charts</div></div>
+      <div class="stat"><div class="val">{assets['tokens']['total']}</div><div class="lbl">Tokens</div></div>
+      <div class="stat"><div class="val" style="color:#ef4444">{assets['detectors']['stale']}</div><div class="lbl">Stale Detectors</div></div>
+      <div class="stat"><div class="val" style="color:#ef4444">{assets['dashboards']['stale']}</div><div class="lbl">Stale Dashboards</div></div>
+    </div>
+  </div>
+
+  <!-- OTEL ADOPTION -->
+  <div class="card">
+    <h2>OTel &amp; Signal Adoption</h2>
+    <div class="stat-grid" style="margin-bottom:20px">
+      <div class="stat"><div class="val">{otel['apm_count']}</div><div class="lbl">APM Services</div></div>
+      <div class="stat"><div class="val">{otel['sdk_count']}</div><div class="lbl">OTel SDK Instrumented</div></div>
+      <div class="stat"><div class="val">{otel['collector_count']}</div><div class="lbl">OTel Collectors</div></div>
+    </div>
+    {'<table><thead><tr><th>Language</th><th>Services</th><th>Service Names</th></tr></thead><tbody>' + otel_lang_rows + '</tbody></table>' if otel_lang_rows else '<p style="color:#94a3b8;font-size:13px">No telemetry.sdk.language dimension detected in MTS.</p>'}
+  </div>
+
+  <!-- USER ACTIVITY -->
+  <div class="card">
+    <h2>User Activity</h2>
+    <table>
+      <thead><tr>
+        <th>User</th><th>Score</th><th>Last Login</th><th>Last Activity</th>
+        <th style="text-align:center">Logins</th><th style="text-align:center">Writes</th>
+        <th style="text-align:center">Det</th><th style="text-align:center">Dash</th><th style="text-align:center">Charts</th>
+      </tr></thead>
+      <tbody>{user_rows}</tbody>
+    </table>
+  </div>
+
+  {'<!-- TEAM ROLLUP --><div class="card"><h2>Team Rollup</h2><table><thead><tr><th>Team</th><th style="text-align:center">Members</th><th style="text-align:center">Active</th><th style="text-align:center">Avg Score</th><th style="text-align:center">Logins</th><th style="text-align:center">Writes</th><th style="text-align:center">Det</th><th style="text-align:center">Dash</th><th style="text-align:center">Charts</th></tr></thead><tbody>' + team_rows + '</tbody></table></div>' if team_rows else ''}
+
+  <!-- DETECTOR HEALTH -->
+  {'<div class="card"><h2>Detector Health Issues</h2><table><thead><tr><th>Detector</th><th>Last Updated</th><th>Flags</th></tr></thead><tbody>' + det_rows + '</tbody></table></div>' if det_rows else ''}
+
+  <!-- TOKEN ATTRIBUTION -->
+  {'<div class="card"><h2>Token Attribution</h2><table><thead><tr><th>Token</th><th>Scopes</th><th style="text-align:center">Users</th><th>Attributed To</th></tr></thead><tbody>' + tok_rows + '</tbody></table></div>' if tok_rows else ''}
+
+  <!-- TOKEN ALERTS -->
+  {'<div class="card"><h2>Token Alerts</h2><table><thead><tr><th>Token</th><th>Status</th><th>Expiry</th></tr></thead><tbody>' + tok_alert_rows + '</tbody></table></div>' if tok_alert_rows else ''}
+
+  <!-- STALE DETECTORS -->
+  {'<div class="card"><h2>Stale Detectors (not updated in >' + str(stale_days) + 'd)</h2><table><thead><tr><th>Name</th><th>Last Updated</th><th>Last Modified By</th></tr></thead><tbody>' + stale_det_rows + '</tbody></table></div>' if stale_det_rows else ''}
+
+  <!-- STALE DASHBOARDS -->
+  {'<div class="card"><h2>Stale Dashboards (not updated in >' + str(stale_days) + 'd)</h2><table><thead><tr><th>Name</th><th>Last Updated</th><th>Last Modified By</th></tr></thead><tbody>' + stale_dash_rows + '</tbody></table></div>' if stale_dash_rows else ''}
+
+  <p class="section-note">Generated by o11y-adoption &nbsp;|&nbsp; Audit API logs write operations only — dashboard views and reads are not recorded.</p>
+</div>
+</body>
+</html>"""
+
+    with open(path, "w") as f:
+        f.write(html)
+    return path
+
+
 def save_csv(users, ownership, path=None):
     import csv
     REPORTS_DIR.mkdir(exist_ok=True)
@@ -620,7 +895,7 @@ def save_csv(users, ownership, path=None):
 def print_report(members, session_events, http_events,
                  detectors, dashboards, charts, tokens,
                  otel_services, apm_services, teams=None,
-                 days=90, stale_days=90, csv_path=None):
+                 days=90, stale_days=90, csv_path=None, html_path=None):
 
     users        = analyze_users(members, session_events, http_events, days)
     assets       = analyze_assets(detectors, dashboards, charts, tokens, stale_days)
@@ -891,6 +1166,16 @@ def print_report(members, session_events, http_events,
         out = save_csv(users, ownership, path=csv_path if csv_path != True else None)
         print(f"\n  CSV saved: {out}")
 
+    # ── HTML export ───────────────────────────────────────────────────────
+    if html_path is not None:
+        out = save_html(
+            users, assets, otel, ownership, org_health, team_data,
+            det_issues, tok_attr, detectors, dashboards, tokens,
+            days, stale_days, REALM,
+            path=html_path if html_path != True else None,
+        )
+        print(f"\n  HTML saved: {out}")
+
     print()
 
 
@@ -924,6 +1209,8 @@ def main():
                           help="Also save full data as JSON to reports/")
     p_report.add_argument("--csv",        action="store_true",
                           help="Save user activity table as CSV to reports/")
+    p_report.add_argument("--html",       action="store_true",
+                          help="Save full report as HTML to reports/")
     p_report.add_argument("--no-otel",    action="store_true",
                           help="Skip OTel MTS dimension scan (faster)")
     p_report.add_argument("--no-teams",   action="store_true",
@@ -1003,7 +1290,8 @@ def main():
                      detectors, dashboards, charts, tokens,
                      otel_services, apm_services, teams=teams,
                      days=eff_days, stale_days=args.stale_days,
-                     csv_path=True if args.csv else None)
+                     csv_path=True if args.csv else None,
+                     html_path=True if args.html else None)
 
         if args.json:
             path = save_json({
