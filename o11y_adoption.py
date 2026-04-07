@@ -104,54 +104,34 @@ def fetch_assets():
 
 def fetch_otel_signals():
     """
-    Detect OTel adoption by sampling MTS dimensions across known OTel metrics.
-    Returns dict of service -> {sdk, language, collector, version}
+    Detect OTel adoption via the Dimension API (GET /v2/dimension).
+    telemetry.sdk.* and service.name are dimension-level metadata, not MTS dimensions.
+    Returns dict: {languages: [str], sdk_names: [str], service_names: [str], collector: bool}
     """
-    otel_metrics = [
-        "otelcol_receiver_accepted_metric_points",
-        "otelcol_exporter_sent_metric_points",
-        "http.server.request.duration_count",
-        "jvm.memory.used",
-        "db.client.connections.usage",
-    ]
-    services = defaultdict(lambda: {
-        "sdk": False, "collector": False,
-        "language": set(), "sdk_version": set(), "collector_version": set(),
-        "metrics": set(),
-    })
-
-    for metric in otel_metrics:
+    def dim_values(key):
         try:
-            result = api_get("/v2/metrictimeseries", {
-                "query": f"sf_metric:{metric}", "limit": 500
-            })
-            mts_list = result.get("results", [])
-            for mts in mts_list:
-                dims = mts.get("dimensions", {})
-                svc  = (dims.get("service.name") or dims.get("service") or
-                        dims.get("sf_service") or "unknown")
-                services[svc]["metrics"].add(metric)
-
-                if "otelcol" in metric:
-                    services[svc]["collector"] = True
-                    if "receiver" in dims or "exporter" in dims:
-                        pass
-                else:
-                    services[svc]["sdk"] = True
-
-                lang = (dims.get("telemetry.sdk.language") or
-                        dims.get("process.runtime.name", ""))
-                if lang:
-                    services[svc]["language"].add(lang)
-
-                ver = dims.get("telemetry.sdk.version", "")
-                if ver:
-                    services[svc]["sdk_version"].add(ver)
-
+            r = api_get("/v2/dimension", {"query": f"key:{key}", "limit": 200})
+            return [d["value"] for d in r.get("results", [])]
         except Exception:
-            continue
+            return []
 
-    return dict(services)
+    languages    = dim_values("telemetry.sdk.language")
+    sdk_names    = dim_values("telemetry.sdk.name")
+    service_names = dim_values("service.name")
+
+    # Collector present if otelcol dimension keys exist
+    try:
+        r = api_get("/v2/dimension", {"query": "key:otelcol*", "limit": 1})
+        collector = len(r.get("results", [])) > 0
+    except Exception:
+        collector = False
+
+    return {
+        "languages":     sorted(set(languages)),
+        "sdk_names":     sorted(set(sdk_names)),
+        "service_names": sorted(set(service_names)),
+        "collector":     collector,
+    }
 
 
 def fetch_apm_services():
@@ -465,23 +445,20 @@ def compute_org_health(users, assets, otel, days):
     return scores
 
 
-def analyze_otel(otel_services, apm_services):
-    apm_names   = {s["serviceName"] for s in apm_services}
-    sdk_svcs    = {s for s, info in otel_services.items() if info["sdk"]}
-    coll_svcs   = {s for s, info in otel_services.items() if info["collector"]}
-    languages   = defaultdict(set)
-    for svc, info in otel_services.items():
-        for lang in info["language"]:
-            languages[lang].add(svc)
+def analyze_otel(otel_signals, apm_services):
+    apm_names = sorted({s["serviceName"] for s in apm_services})
+    # APM services present in topology = instrumented (sending traces via agent/OTel)
+    sdk_count = len(apm_names)
 
     return {
-        "apm_services":        sorted(apm_names),
-        "sdk_instrumented":    sorted(sdk_svcs),
-        "collector_present":   sorted(coll_svcs),
-        "languages":           {lang: sorted(svcs) for lang, svcs in languages.items()},
-        "apm_count":           len(apm_names),
-        "sdk_count":           len(sdk_svcs),
-        "collector_count":     len(coll_svcs),
+        "apm_services":    apm_names,
+        "apm_count":       len(apm_names),
+        "sdk_count":       sdk_count,          # APM topology = instrumented services
+        "collector":       otel_signals.get("collector", False),
+        "collector_count": 1 if otel_signals.get("collector") else 0,
+        "languages":       otel_signals.get("languages", []),
+        "sdk_names":       otel_signals.get("sdk_names", []),
+        "service_names":   otel_signals.get("service_names", []),
     }
 
 
@@ -701,8 +678,8 @@ def save_html(users, assets, otel, ownership, org_health, team_data,
 
     # ── OTel rows ─────────────────────────────────────────────────────────
     otel_lang_rows = ""
-    for lang, svcs in sorted(otel.get("languages", {}).items()):
-        otel_lang_rows += f"<tr><td>{lang}</td><td>{len(svcs)}</td><td>{', '.join(svcs[:6])}{'...' if len(svcs) > 6 else ''}</td></tr>"
+    for lang in otel.get("languages", []):
+        otel_lang_rows += f"<tr><td>{lang}</td></tr>"
 
     def dim_card(label, val, maxv, color, detail=""):
         p = pct(val, maxv)
@@ -808,10 +785,13 @@ def save_html(users, assets, otel, ownership, org_health, team_data,
     <h2>OTel &amp; Signal Adoption</h2>
     <div class="stat-grid" style="margin-bottom:20px">
       <div class="stat"><div class="val">{otel['apm_count']}</div><div class="lbl">APM Services</div></div>
-      <div class="stat"><div class="val">{otel['sdk_count']}</div><div class="lbl">OTel SDK Instrumented</div></div>
-      <div class="stat"><div class="val">{otel['collector_count']}</div><div class="lbl">OTel Collectors</div></div>
+      <div class="stat"><div class="val">{otel['sdk_count']}</div><div class="lbl">Instrumented Services</div></div>
+      <div class="stat"><div class="val">{'1' if otel['collector'] else '0'}</div><div class="lbl">OTel Collector</div></div>
     </div>
-    {'<table><thead><tr><th>Language</th><th>Services</th><th>Service Names</th></tr></thead><tbody>' + otel_lang_rows + '</tbody></table>' if otel_lang_rows else '<p style="color:#94a3b8;font-size:13px">No telemetry.sdk.language dimension detected in MTS.</p>'}
+    <div style="margin-top:12px;font-size:13px;color:#475569">
+      <b>Languages:</b> {', '.join(otel['languages']) if otel['languages'] else 'none detected'}
+      &nbsp;&nbsp; <b>SDK names:</b> {', '.join(otel['sdk_names']) if otel['sdk_names'] else 'none detected'}
+    </div>
   </div>
 
   <!-- USER ACTIVITY -->
@@ -950,17 +930,18 @@ def print_report(members, session_events, http_events,
   Tokens:      {assets['tokens']['total']:>4}  ({assets['tokens']['expiring_7d']} expiring <7d, {assets['tokens']['expiring_30d']} expiring <30d, {assets['tokens']['expired']} expired)""")
 
     # ── OTel / signal adoption ────────────────────────────────────────────
+    svc_list   = ', '.join(otel['apm_services'][:6]) + ('...' if otel['apm_count'] > 6 else '')
+    coll_str   = "yes" if otel['collector'] else "not detected"
+    lang_list  = ', '.join(otel['languages']) if otel['languages'] else "none detected"
+    sdk_list   = ', '.join(otel['sdk_names'])  if otel['sdk_names']  else "none detected"
     print(f"""
   OTEL & SIGNAL ADOPTION
   {"─" * 50}
-  APM services (traces):        {otel['apm_count']:>4}  {', '.join(otel['apm_services'][:6]) + ('...' if otel['apm_count'] > 6 else '')}
-  OTel SDK instrumented:        {otel['sdk_count']:>4}  {', '.join(otel['sdk_instrumented'][:4]) + ('...' if otel['sdk_count'] > 4 else '')}
-  OTel Collector deployments:   {otel['collector_count']:>4}""")
-    if otel["languages"]:
-        for lang, svcs in sorted(otel["languages"].items()):
-            print(f"  Language — {lang:<12}          {len(svcs):>4}  {', '.join(svcs[:4])}")
-    else:
-        print("  Languages:                     no telemetry.sdk.language dimension detected")
+  APM services (traces):        {otel['apm_count']:>4}  {svc_list}
+  OTel SDK instrumented:        {otel['sdk_count']:>4}  (= APM topology count)
+  OTel Collector:                     {coll_str}
+  SDK languages detected:             {lang_list}
+  SDK names detected:                 {sdk_list}""")
 
     # ── User activity table ───────────────────────────────────────────────
     print(f"""
