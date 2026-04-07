@@ -163,22 +163,12 @@ def fetch_deployment_environments():
 
 def fetch_service_languages():
     """
-    Build a dict of service_name -> language by querying service.name dimensions
-    and checking their customProperties for telemetry.sdk.language.
-    Returns dict: {service: language_str}
+    Per-service language mapping is not available via dimension or MTS APIs
+    (telemetry.sdk.language is a span resource attribute, not a metric dimension,
+    and customProperties on service.name dimensions are always empty).
+    Returns empty dict — caller falls back to org-wide language signals.
     """
-    try:
-        rs = api_get("/v2/dimension", {"query": "key:service.name", "limit": 500})
-        svc_lang_map = {}
-        for svc_dim in rs.get("results", []):
-            svc_name = svc_dim.get("value", "")
-            props = svc_dim.get("customProperties", {})
-            lang = props.get("telemetry.sdk.language")
-            if lang and svc_name:
-                svc_lang_map[svc_name] = lang
-        return svc_lang_map
-    except Exception:
-        return {}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -531,15 +521,16 @@ def analyze_app_insights(apm_nodes, apm_edges, otel_signals, svc_lang_map, envir
         dep_types[ntype] += 1
 
     # Service-to-service dependency graph
+    # APM topology edges use "fromNode"/"toNode" keys
     svc_names = {n.get("serviceName") for n in real_services}
     dep_graph = []
     in_degree = defaultdict(int)   # how many services call this one
     out_degree = defaultdict(int)  # how many services this one calls
 
     for edge in apm_edges:
-        src = edge.get("from", "")
-        dst = edge.get("to", "")
-        if src and dst:
+        src = edge.get("fromNode") or edge.get("from", "")
+        dst = edge.get("toNode")   or edge.get("to", "")
+        if src and dst and src != dst:  # skip self-loops
             dep_graph.append({"from": src, "to": dst})
             out_degree[src] += 1
             in_degree[dst] += 1
@@ -547,15 +538,28 @@ def analyze_app_insights(apm_nodes, apm_edges, otel_signals, svc_lang_map, envir
     # Hub services = highest in-degree (most depended-upon)
     hub_services = sorted(svc_names, key=lambda s: -in_degree.get(s, 0))[:5]
 
-    # Language breakdown across all services
+    # Language breakdown — org-wide from dimension API (per-service not available)
     lang_counts = defaultdict(int)
     for s in enriched_services:
         if s["language"]:
             lang_counts[s["language"]] += 1
-    # Fall back to org-wide language signals if per-service map is sparse
     if not lang_counts and otel_signals.get("languages"):
         for lang in otel_signals["languages"]:
-            lang_counts[lang] = 1  # present org-wide, count unknown per-service
+            lang_counts[lang] = 1  # present org-wide; per-service mapping unavailable
+
+    # Environment categorization
+    env_categories = {"workshop": [], "production": [], "staging": [], "dev": [], "other": []}
+    for env in environments:
+        if env.endswith("-workshop"):
+            env_categories["workshop"].append(env)
+        elif env in ("production", "prod"):
+            env_categories["production"].append(env)
+        elif env in ("staging", "stage"):
+            env_categories["staging"].append(env)
+        elif env in ("dev", "development", "local"):
+            env_categories["dev"].append(env)
+        else:
+            env_categories["other"].append(env)
 
     # Stack type fingerprinting
     stack_types = []
@@ -586,6 +590,7 @@ def analyze_app_insights(apm_nodes, apm_edges, otel_signals, svc_lang_map, envir
         "hub_services":       hub_services,
         "language_breakdown": dict(lang_counts),
         "environments":       environments,
+        "env_categories":     env_categories,
         "stack_types":        stack_types,
     }
 
@@ -689,32 +694,32 @@ def _html_app_insights(ai):
     if not ai:
         return ""
 
-    # Service rows
+    # Service rows — sorted by in-degree (most called first)
     svc_rows = ""
-    for s in sorted(ai["services"], key=lambda x: x["name"]):
-        lang_badge = (f'<span style="background:#8b5cf6;color:#fff;padding:1px 7px;'
-                      f'border-radius:9px;font-size:11px">{s["language"]}</span>'
-                      if s["language"] else "—")
-        hub = "★" if s["name"] in ai["hub_services"][:3] else ""
+    for s in sorted(ai["services"], key=lambda x: -ai["in_degree"].get(x["name"], 0)):
+        hub = "★ " if s["name"] in ai["hub_services"][:3] and ai["in_degree"].get(s["name"], 0) > 0 else ""
         callers = ai["in_degree"].get(s["name"], 0)
         callees = ai["out_degree"].get(s["name"], 0)
-        svc_rows += (f'<tr><td>{hub} {s["name"]}</td><td>{lang_badge}</td>'
+        hub_style = "font-weight:700" if hub else ""
+        svc_rows += (f'<tr><td style="{hub_style}">{hub}{s["name"]}</td>'
                      f'<td style="text-align:center">{callers}</td>'
                      f'<td style="text-align:center">{callees}</td></tr>')
 
     # Inferred dep rows
     dep_rows = ""
     for n in sorted(ai["inferred_deps"], key=lambda x: x.get("serviceName", "")):
+        dtype = n.get("type", "unknown")
+        color = "#dc2626" if dtype == "database" else "#64748b"
         dep_rows += (f'<tr><td>{n.get("serviceName","?")}</td>'
-                     f'<td><span style="background:#64748b;color:#fff;padding:1px 7px;'
-                     f'border-radius:9px;font-size:11px">{n.get("type","unknown")}</span></td></tr>')
+                     f'<td><span style="background:{color};color:#fff;padding:1px 7px;'
+                     f'border-radius:9px;font-size:11px">{dtype}</span></td></tr>')
 
-    # Language breakdown badges
+    # Language badges (org-wide)
     lang_badges = ""
-    for lang, cnt in sorted(ai["language_breakdown"].items(), key=lambda x: -x[1]):
+    for lang in sorted(ai["language_breakdown"].keys()):
         lang_badges += (f'<span style="background:#3b82f6;color:#fff;padding:3px 10px;'
                         f'border-radius:12px;font-size:12px;margin:2px;display:inline-block">'
-                        f'{lang} ({cnt})</span> ')
+                        f'{lang}</span> ')
 
     # Stack type badges
     stack_badges = ""
@@ -723,12 +728,31 @@ def _html_app_insights(ai):
                          f'border-radius:12px;font-size:12px;margin:2px;display:inline-block">'
                          f'{st}</span> ')
 
-    # Environment badges
-    env_badges = ""
-    for env in ai["environments"]:
-        env_badges += (f'<span style="background:#f59e0b;color:#fff;padding:3px 10px;'
-                       f'border-radius:12px;font-size:12px;margin:2px;display:inline-block">'
-                       f'{env}</span> ')
+    # Environment breakdown by category
+    ec = ai.get("env_categories", {})
+    env_section = ""
+    cat_colors = {"production": "#16a34a", "staging": "#2563eb", "dev": "#7c3aed", "other": "#64748b", "workshop": "#d97706"}
+    cat_labels = {"production": "Production", "staging": "Staging", "dev": "Dev", "other": "Other", "workshop": "Workshop"}
+    for cat in ["production", "staging", "dev", "other", "workshop"]:
+        envs = ec.get(cat, [])
+        if not envs:
+            continue
+        color = cat_colors[cat]
+        label = cat_labels[cat]
+        if cat == "workshop":
+            env_section += f'<div style="margin-bottom:6px"><span style="font-size:11px;color:#64748b;font-weight:600">{label} ({len(envs)})</span><br>'
+            for e in sorted(envs)[:6]:
+                env_section += (f'<span style="background:{color};color:#fff;padding:2px 8px;'
+                                f'border-radius:10px;font-size:11px;margin:1px;display:inline-block">{e}</span>')
+            if len(envs) > 6:
+                env_section += f'<span style="font-size:11px;color:#94a3b8"> +{len(envs)-6} more</span>'
+            env_section += '</div>'
+        else:
+            env_section += f'<div style="margin-bottom:6px"><span style="font-size:11px;color:#64748b;font-weight:600">{label}</span><br>'
+            for e in sorted(envs):
+                env_section += (f'<span style="background:{color};color:#fff;padding:2px 8px;'
+                                f'border-radius:10px;font-size:11px;margin:1px;display:inline-block">{e}</span>')
+            env_section += '</div>'
 
     return f"""
   <div class="card">
@@ -739,12 +763,15 @@ def _html_app_insights(ai):
       <div class="stat"><div class="val">{len(ai['dependency_graph'])}</div><div class="lbl">Service Calls</div></div>
       <div class="stat"><div class="val">{len(ai['environments'])}</div><div class="lbl">Environments</div></div>
     </div>
-    {'<div style="margin-bottom:10px"><b style="font-size:12px;color:#64748b">STACK TYPES</b><br>' + stack_badges + '</div>' if stack_badges else ''}
-    {'<div style="margin-bottom:10px"><b style="font-size:12px;color:#64748b">LANGUAGES</b><br>' + lang_badges + '</div>' if lang_badges else ''}
-    {'<div style="margin-bottom:16px"><b style="font-size:12px;color:#64748b">ENVIRONMENTS</b><br>' + env_badges + '</div>' if env_badges else ''}
-    <div style="display:flex;gap:20px;flex-wrap:wrap">
-      {'<div style="flex:2;min-width:300px"><b style="font-size:12px;color:#64748b">SERVICES</b><table style="margin-top:8px"><thead><tr><th>Service</th><th>Language</th><th style="text-align:center">Called By</th><th style="text-align:center">Calls</th></tr></thead><tbody>' + svc_rows + '</tbody></table></div>' if svc_rows else ''}
-      {'<div style="flex:1;min-width:200px"><b style="font-size:12px;color:#64748b">INFERRED DEPENDENCIES</b><table style="margin-top:8px"><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>' + dep_rows + '</tbody></table></div>' if dep_rows else ''}
+    {'<div style="margin-bottom:12px"><b style="font-size:12px;color:#64748b">STACK TYPES</b><br><div style="margin-top:4px">' + stack_badges + '</div></div>' if stack_badges else ''}
+    {'<div style="margin-bottom:12px"><b style="font-size:12px;color:#64748b">LANGUAGES (org-wide)</b><br><div style="margin-top:4px">' + lang_badges + '</div></div>' if lang_badges else ''}
+    <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:8px">
+      <div style="flex:1;min-width:200px">
+        <b style="font-size:12px;color:#64748b">ENVIRONMENTS ({len(ai['environments'])} total)</b>
+        <div style="margin-top:8px">{env_section}</div>
+      </div>
+      {'<div style="flex:1;min-width:240px"><b style="font-size:12px;color:#64748b">SERVICES</b><table style="margin-top:8px"><thead><tr><th>Service</th><th style="text-align:center">Called By</th><th style="text-align:center">Calls</th></tr></thead><tbody>' + svc_rows + '</tbody></table></div>' if svc_rows else ''}
+      {'<div style="flex:1;min-width:180px"><b style="font-size:12px;color:#64748b">INFERRED DEPENDENCIES</b><table style="margin-top:8px"><thead><tr><th>Name</th><th>Type</th></tr></thead><tbody>' + dep_rows + '</tbody></table></div>' if dep_rows else ''}
     </div>
   </div>"""
 
@@ -1150,24 +1177,37 @@ def print_report(members, session_events, http_events,
         print(f"""
   APPLICATION INSIGHTS
   {"─" * width}""")
-        # Environments
+        # Environment breakdown by category
+        ec = ai["env_categories"]
         if ai["environments"]:
-            print(f"  Environments:    {', '.join(ai['environments'])}")
+            print(f"  Environments ({len(ai['environments'])} total):")
+            if ec["production"]:
+                print(f"    Production:  {', '.join(ec['production'])}")
+            if ec["staging"]:
+                print(f"    Staging:     {', '.join(ec['staging'])}")
+            if ec["dev"]:
+                print(f"    Dev:         {', '.join(ec['dev'])}")
+            if ec["other"]:
+                print(f"    Other:       {', '.join(sorted(ec['other']))}")
+            if ec["workshop"]:
+                print(f"    Workshop:    {len(ec['workshop'])} envs  ({', '.join(sorted(ec['workshop'])[:4])}{'...' if len(ec['workshop']) > 4 else ''})")
         # Stack types
         if ai["stack_types"]:
-            print(f"  Stack types:     {', '.join(ai['stack_types'])}")
+            print(f"\n  Stack types:     {', '.join(ai['stack_types'])}")
         # Language breakdown
         if ai["language_breakdown"]:
-            lang_parts = [f"{lang} ({cnt})" for lang, cnt in
-                          sorted(ai["language_breakdown"].items(), key=lambda x: -x[1])]
-            print(f"  Languages:       {', '.join(lang_parts)}")
-        # Service inventory
+            lang_parts = [f"{lang}" for lang in sorted(ai["language_breakdown"].keys())]
+            print(f"  Languages:       {', '.join(lang_parts)}  (org-wide)")
+        # Service inventory with call counts
         if ai["services"]:
             print(f"\n  Services ({ai['service_count']}):")
-            for s in sorted(ai["services"], key=lambda x: x["name"]):
-                lang_tag = f"  [{s['language']}]" if s["language"] else ""
-                hub_tag  = "  ★ hub" if s["name"] in ai["hub_services"][:3] else ""
-                print(f"    {s['name']:<35}{lang_tag}{hub_tag}")
+            print(f"    {'Name':<35} {'Called by':>9} {'Calls':>6}")
+            print(f"    {'─'*52}")
+            for s in sorted(ai["services"], key=lambda x: -ai["in_degree"].get(x["name"], 0)):
+                hub_tag  = " ★" if s["name"] in ai["hub_services"][:3] and ai["in_degree"].get(s["name"], 0) > 0 else ""
+                callers  = ai["in_degree"].get(s["name"], 0)
+                callees  = ai["out_degree"].get(s["name"], 0)
+                print(f"    {s['name']:<35} {callers:>9} {callees:>6}{hub_tag}")
         # Inferred dependencies
         if ai["inferred_deps"]:
             dep_parts = []
@@ -1177,14 +1217,6 @@ def print_report(members, session_events, http_events,
             print(f"\n  Inferred dependencies:  {', '.join(dep_parts)}")
             for n in sorted(ai["inferred_deps"], key=lambda x: x.get("serviceName", "")):
                 print(f"    {n.get('serviceName', '?'):<35}  [{n.get('type','unknown')}]")
-        # Hub services (most called)
-        real_hubs = [s for s in ai["hub_services"] if ai["in_degree"].get(s, 0) > 0]
-        if real_hubs:
-            print(f"\n  Most-depended-upon services:")
-            for svc in real_hubs[:5]:
-                callers = ai["in_degree"].get(svc, 0)
-                callees = ai["out_degree"].get(svc, 0)
-                print(f"    {svc:<35}  called by {callers} service(s), calls {callees}")
 
     # ── User activity table ───────────────────────────────────────────────
     print(f"""
