@@ -138,13 +138,177 @@ python3 o11y_adoption.py report --html
 # → reports/adoption_report_<timestamp>.html
 ```
 
-Generates a self-contained single-file HTML report (no external dependencies, works offline) with:
-- Org health score with letter grade, full-width progress bar, and dimension cards
-- Platform overview stat cards
-- User activity table with inline per-user score bars (color-coded green/yellow/red)
-- OTel adoption — instrumented service count, collector status, language and SDK breakdown
-- Team rollup, detector health issues, token attribution, token alerts
-- Stale detector and dashboard tables
+Self-contained single-file HTML report (no external dependencies, works offline).
+
+**Report sections:**
+
+| Section | Contents |
+|---------|----------|
+| Executive Summary | Health grade (A–F), score/100, active users, Champions/Churning count, top 3 actions |
+| Recommended Actions | Prioritised action list with category and detail |
+| Org Health Score | Overall score + 4 dimension cards: User Adoption, OTel Coverage, Asset Hygiene, Token Health |
+| User Activity | Per-user engagement score bar, last login, write ops, TTFV, feature areas, API vs UI split |
+| Team Rollup | Team-level activity aggregation: members, active count, avg score |
+| OTel / APM Coverage | APM service map, per-service environment coverage, SDK languages |
+| Detector Health | Detectors with issues: no notifications, disabled, always-muting |
+| Token Attribution | Token → user mapping with scope and shared-token flags |
+| Stale Assets | Detectors and dashboards not updated in >90 days |
+| … 30+ more sections | Alert fatigue, incident MTTA, dashboard complexity, cardinality hotspots, etc. |
+
+**Report features:**
+- Sidebar navigation with search — jump to any section instantly
+- Sticky summary bar — grade, active users, stale assets always visible
+- Dark / light mode toggle
+- Sortable tables (click any column header)
+- Collapsible sections — expand/collapse each card
+- Print-friendly layout
+
+**Sample layout:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ [sticky bar]  B  66/100  |  6/10 active users  |  20 stale detectors       │
+├──────────┬──────────────────────────────────────────────────────────────────┤
+│ Sections │  Splunk Observability Cloud — Adoption Report          [🌙][🖨] │
+│ [search] │  realm=us1 | generated 2026-04-23 | activity window: last 90d    │
+│          │                                                                   │
+│ Exec Sum │  ┌─ B  66/100 ──────────────────────────────────────────────────┐│
+│ Actions  │  │  6/10 active  ·  0 Champions  ·  0 Churning                  ││
+│ Health   │  │  ▲ Active Users +300%  ▲ Write Ops +110%                      ││
+│ Users    │  │  [critical] Review 1 recently-elevated admin                  ││
+│ Teams    │  │  [critical] Deactivate 4 inactive admins with 8 live tokens   ││
+│ OTel     │  └──────────────────────────────────────────────────────────────┘│
+│ APM      │                                                                   │
+│ Detectors│  ▼ Org Health Score                66/100  B                     │
+│ Tokens   │    User Adoption  15/25  ████████░░  6 of 10 active              │
+│ Stale    │    OTel Coverage  25/25  ██████████  7 of 7 services instrumented│
+│ ...      │    Asset Hygiene   6/25  ███░░░░░░░  52 of 204 assets not stale  │
+│          │    Token Health   20/25  █████████░  8 of 10 healthy             │
+│          │                                                                   │
+│          │  ▼ User Activity (sortable, 90d window)                          │
+│          │    Email          Score  Last Login    Logins  Writes  TTFV  Tag │
+│          │    mbui@splunk    92/100  2026-04-22       9      46    2d  Champ │
+│          │    gravi@splunk   32/100  2026-04-11       3       0    —   View  │
+└──────────┴───────────────────────────────────────────────────────────────────┘
+```
+
+### How to read the HTML report
+
+Open the `.html` file from `reports/` in any browser — no server required.
+
+#### Navigation
+
+- **Sticky bar** (top) — health grade, score/100, and the four dimension sub-scores always visible while scrolling
+- **Sidebar** (left) — jump to any section; type in the search box to filter cards by keyword
+- **Dark mode / Print** — buttons in the top-right of the header
+
+#### Section by section
+
+**Executive Summary**
+
+The large letter grade. Score is composed of four equal dimensions (25 pts each):
+
+| Dimension | What it measures |
+|-----------|-----------------|
+| **User Adoption** (blue) | Active users ÷ total users |
+| **OTel Coverage** (purple) | APM services with OTel SDK ÷ total APM services |
+| **Asset Hygiene** (green) | Non-stale assets ÷ total detectors + dashboards |
+| **Token Health** (amber) | Healthy tokens ÷ total tokens (penalises expired + expiring <7d) |
+
+Grade: A ≥80 · B ≥65 · C ≥50 · D ≥35 · F <35
+
+The summary also shows Champions (high-engagement users) and Churning (users whose score dropped significantly) counts, and the top 3 recommended actions.
+
+**Recommended Actions**
+
+Prioritised list of the highest-impact things to do — inactive admins, broken notification channels, expiring tokens, uninstrumented services.
+
+**Org Health Score**
+
+The four dimension cards with progress bars showing exact scores and the counts behind them (e.g. "6 of 10 users active").
+
+**Platform Overview**
+
+Snapshot stat tiles: active/total users, detector/dashboard/chart counts, token count, stale detector and dashboard counts (red).
+
+**OTel & Signal Adoption**
+
+How much of your APM fleet is instrumented, which languages/SDKs are in use, whether an OTel Collector is deployed.
+
+**Application Insights**
+
+Per-service breakdown from the APM topology graph:
+- **Stack type** — inferred from language distribution (e.g. "Java microservices")
+- **Hub services** — highest in-degree nodes (API gateways, shared libs)
+- **Inferred dependencies** — databases and external HTTP endpoints detected as uninstrumented topology nodes
+- **Environments** — all `deployment.environment` values seen in traces
+
+**User Activity**
+
+One row per user. Key columns:
+
+| Column | What it means |
+|--------|--------------|
+| **Score / Δ30d** | Engagement score (0–100) and change over 30 days |
+| **Last Login / Activity** | Recency signals |
+| **Logins / Reads / Writes** | Volume of interactions in the window |
+| **Avg Session** | Mean session length |
+| **API%** | Fraction of activity via API vs UI — high = power user or automation |
+| **TTFV** | Time to First Value — days from account creation to first meaningful action |
+| **Det / Dash / Charts** | Asset counts owned by this user |
+| **Top Features** | Product areas used most frequently |
+
+User tags: **Champion** (score ≥80, consistent activity), **Churning** (score dropped >30pts), **Power User** (high write activity), **View Only** (logins but no writes), **At Risk** (declining engagement).
+
+**Team Rollup**
+
+Same metrics aggregated by team tag — active member count, average score, total writes, asset counts. Use this to compare adoption across teams.
+
+**Detector Health Issues**
+
+Detectors flagged for problems: no notification routing configured, disabled, never fired, always-muting, stale (not updated in >90 days), no tags. Each flag category is a separate signal — a detector that never fires and has no notifications is silently broken.
+
+**APM Dependency Graph**
+
+Interactive bubble graph of service-to-service call relationships. Node size = call volume, red fill = service has active errors. Shows which services are true hubs vs leaf nodes.
+
+**Feature Heatmap**
+
+Grid of users × product features. Dark cell = heavy use, empty = never used. Identifies adoption gaps by feature area or team.
+
+**Alert Severity Distribution**
+
+Breakdown of fired alerts by severity. A healthy distribution has mostly Warning/Minor with few Critical — inverted distributions (mostly Critical) suggest detectors are mis-tuned.
+
+**Alert Fatigue**
+
+Detectors firing too frequently — likely causing engineers to ignore them. Sorted by firing rate descending.
+
+**Notification Channel Health**
+
+Whether PagerDuty, Slack, email, and other channels are reachable. Broken channels mean alerts are silently not delivered.
+
+**Token Expiry & Scope Audit**
+
+Tokens expiring soon or already expired, plus tokens with more scopes than necessary. Expired tokens break integrations; over-scoped tokens are a security risk.
+
+**Orphaned Assets**
+
+Detectors, dashboards, and charts whose creator no longer exists in the org. Effectively unowned — no one will respond when they alert or notice when they go stale.
+
+**Onboarding Velocity / TTFV**
+
+How quickly users in each cohort (month of joining) reached their first meaningful action. A shortening TTFV trend means onboarding is improving.
+
+**Asset Age Distribution**
+
+Histogram of detector and dashboard ages. A large spike of very old assets suggests accumulated technical debt and detectors alerting on obsolete signals.
+
+**Report Changelog**
+
+Diff vs the previous snapshot — new users, changed scores, new assets, resolved/new issues. Useful for weekly standups and sprint reviews.
+
+---
 
 ## Example terminal output
 
