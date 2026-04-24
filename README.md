@@ -75,9 +75,11 @@ Prints a full report with the following sections (in order):
 | `--stale-days N` | 90 | Mark assets stale if not updated in N days |
 | `--no-otel` | off | Skip OTel Dimension API scan (faster) |
 | `--no-teams` | off | Skip team rollup section |
+| `--no-cache` | off | Force fresh API fetch, bypass local cache |
 | `--csv` | off | Save user activity table to `reports/adoption_users_<ts>.csv` |
 | `--html` | off | Save full report as HTML to `reports/adoption_report_<ts>.html` |
 | `--json` | off | Save full raw data to `reports/adoption_report_<ts>.json` |
+| `--baseline PATH` | — | Path to a previous `--json` snapshot for changelog diffing |
 
 ### `users` — user activity only
 
@@ -313,64 +315,142 @@ Diff vs the previous snapshot — new users, changed scores, new assets, resolve
 ## Example terminal output
 
 ```
+==============================================================================================================
+  Splunk Observability Adoption Report  |  realm=us1  |  2026-04-24 03:41 UTC
+  Activity window: last 90 days  |  Stale threshold: >90 days since last update
+==============================================================================================================
+
   ORG HEALTH SCORE
   ──────────────────────────────────────────────────
-  Overall:  ██████████░░░░░░░░░░  49/100  (D)
+  Overall:  ██████████████░░░░░░  71/100  (B)
 
-  User adoption    ████████░░    19/25   7 of 9 users active in last 90d
-  OTel coverage    ██████████    25/25   8 of 8 APM services OTel-instrumented
-  Asset hygiene    ███░░░░░░░     7/25   51 of 182 detectors+dashboards not stale
-  Token health     █████████░    23/25   20 of 22 tokens healthy
+  User adoption    ██████░░░░    15/25   6 of 10 users active in last 90d
+  OTel coverage    ██████████    25/25   7 of 7 APM services OTel-instrumented
+  Asset hygiene    ███░░░░░░░     6/25   52 of 205 detectors+dashboards not stale
+  Token health     ██████████    25/25   1 of 1 tokens healthy
+
+  PLATFORM OVERVIEW
+  ──────────────────────────────────────────────────
+  Users (total):         10
+  Users (active 90d):    6
+  Users (inactive):       4
+
+  Detectors:     30  (10 active, 20 stale >90d)
+  Dashboards:   175  (42 active, 133 stale >90d)
+  Charts:      1000
+
+  Tokens:         1  (0 expiring <7d, 0 expiring <30d, 0 expired)
+
+  OTEL & SIGNAL ADOPTION
+  ──────────────────────────────────────────────────
+  APM services (traces):           7  admin-server, api-gateway, config-server, customers-service, discovery-server, vets-service...
+  OTel SDK instrumented:           7  (= APM topology count)
+  OTel Collector:                     yes
+  SDK languages detected:             dotnet, generic, go, java, nodejs, python
+  SDK names detected:                 beyla, opentelemetry, opentelemetry-ebpf-instrumentation
 
   APPLICATION INSIGHTS
   ──────────────────────────────────────────────────────────────────────────
-  Environments:    production, staging
-  Stack types:     Java microservices, 1 database(s) detected
-  Languages:       java (6), python (1)
+  Environments (41 total):
+    Production:  production
+    Dev:         dev
+    Other:       demo, lab, test, unknown
+    Workshop:    30 envs
 
-  Services (8):
-    admin-server                        [java]
-    api-gateway                         [java]  ★ hub
-    config-server                       [java]
-    customers-service                   [java]
-    discovery-server                    [java]
-    vets-service                        [java]
-    visits-service                      [java]
-    worker-service                      [python]
+  Stack types:     Java microservices, Python services, Node.js services, Go services, .NET/generic services, 1 database(s) detected
+  Languages:       dotnet, generic, go, java, nodejs, python  (org-wide)
+
+  Services (7):
+    Name                   Environments
+    ─────────────────────────────────────────────────────
+    admin-server           production, dev, demo, lab, test, unknown, workshop (30 envs)
+    api-gateway            production, dev, demo, lab, test, unknown, workshop (30 envs)  ★ hub
+    config-server          production, dev, demo, lab, test, unknown, workshop (30 envs)
+    customers-service      production, dev, demo, lab, test, unknown, workshop (30 envs)
+    discovery-server       production, dev, demo, lab, test, unknown, workshop (30 envs)
+    vets-service           production, dev, demo, lab, test, unknown, workshop (30 envs)
+    visits-service         production, dev, demo, lab, test, unknown, workshop (30 envs)
 
   Inferred dependencies:
-    mysql:petclinic                     [database]
+    mysql:petclinic        [database]
+    localhost:8888         [service]
 
-  Most-depended-upon services:
-    api-gateway                           called by 3 service(s), calls 4
+  PRODUCT ADOPTION COVERAGE  (1/7 products active)
+  ──────────────────────────────────────────────────────────────────────
+  ✓  APM / Tracing                   35 service(s) sending traces
+  ✗  Infrastructure Monitoring       No AWS/GCP/Azure/K8s integrations configured
+  ✗  RUM                             No RUM activity detected
+  ✗  Log Observer                    No Log Observer activity
+  ✗  Synthetics                      No Synthetics activity
+  ✗  Profiling                       No profiling SDK detected
+  ✗  Alerting / On-Call              No notification integrations configured
+
+  DETECTOR SERVICE COVERAGE  1/7 services covered (14%)
+  ────────────────────────────────────────────────────────────
+  Uncovered: admin-server, api-gateway, config-server, customers-service, discovery-server, vets-service
+
+  ENGAGEMENT TREND  (last 30d vs prev 30d)
+  ──────────────────────────────────────────────────────────────────────
+  User                     Tag              Prev30  Last30   Delta
+  ──────────────────────────────────────────────────────────────────────
+  mbui@splunk.com          Power Builder        38      64 ▲    26
+  ayaseen@splunk.com       Active                0       1 ▲     1
+  gravi@splunk.com         Active                1       1 →     0
+  sde@splunk.com           Active                1       1 →     0
 
   USER ACTIVITY  (last 90 days)
-  ──────────────────────────────────────────────────────────────────────────
-  User                                 Score  Last Login             Logins  Writes
-  ──────────────────────────────────────────────────────────────────────────
-  mbui@splunk.com [admin]              92/100  2026-03-25 03:37 UTC       9      46
-  gravi@splunk.com                     32/100  2026-03-11 18:20 UTC       3       0
-  agrover@splunk.com [admin]            5/100  never                      0       0
-
-  TEAM ROLLUP
-  ──────────────────────────────────────────────────────────────────────────
-  Team                            Members  Active  Avg Score  Logins  Writes   Det   Dash  Charts
-  ──────────────────────────────────────────────────────────────────────────
-  platform-engineering                  4       3         58      14      46     4     35     222
-  sre-team                              2       1         32       3       0     0      1       0
-
-  DETECTOR HEALTH ISSUES  — 27 detector(s) flagged
-  ──────────────────────────────────────────────────────────────────────────
-  Name                                               Last Updated           Flags
-  K8s nodes are not ready                            2025-03-24 21:45 UTC   no-notifications
-  AWS EC2: CPU utilization expected to reach limit   2025-03-21 17:30 UTC   no-notifications
-
-  TOKEN ATTRIBUTION  (tokens seen in login events)
   ──────────────────────────────────────────────────────────────────────
-  Token                               Scopes       Users  Users
+  User                                 Score  Last Login             Last Activity           Logins  Writes  Resources Used
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  mbui@splunk.com [admin]              70/100  2026-03-25 03:37 UTC   2026-04-23 18:56 UTC         8      94  team, token
+  gravi@splunk.com                     30/100  2026-04-22 17:44 UTC   2026-04-22 17:44 UTC         2       0  —
+  ayaseen@splunk.com [admin]           28/100  2026-04-21 15:09 UTC   2026-04-21 15:09 UTC         1       0  —
+  sde@splunk.com [admin]               30/100  2026-04-13 14:06 UTC   2026-04-13 14:06 UTC         2       0  —
+  ekalosakenyon@splunk.com [admin]      2/100  never                  never                        0       0  —
+  samx@splunk.com [admin]               2/100  never                  never                        0       0  —
+
+  LOGIN FREQUENCY  (logins per calendar week)
   ──────────────────────────────────────────────────────────────────────
-  default-session-token               API              3  alice@co.com, bob@co.com, carol@co.com  [SHARED]
-  mbui-personal                       API, INGEST      1  mbui@splunk.com
+  User                                 W04  W05  W08  W09  W10  W11  W12  W15  W16
+  ──────────────────────────────────────────────────────────────────────────────────
+  mbui@splunk.com [admin]                .    .    1    2    .    2    3    .    .
+  gravi@splunk.com                       .    .    .    .    1    .    .    .    1
+  ayaseen@splunk.com [admin]             .    .    .    .    .    .    .    .    1
+  sde@splunk.com [admin]                 .    .    .    1    .    .    .    1    .
+
+  LOGIN HEATMAP  (org-wide logins by day/hour UTC)
+  ──────────────────────────────────────────────────────────────────────
+  Day   00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+  ───────────────────────────────────────────────────────────────────────────────
+  Mon    .  .  .  .  1  .  .  .  .  .  .  .  .  .  1  .  1  .  1  .  .  .  .  .
+  Tue    .  .  .  .  .  1  .  .  .  .  .  .  .  .  .  1  .  1  .  .  .  .  .  .
+  Wed    .  .  .  1  .  .  .  .  .  .  .  .  .  .  .  .  .  1  1  .  1  .  .  .
+  Thu    .  .  .  .  2  .  .  .  .  .  .  .  .  .  .  .  .  .  .  1  .  .  .  .
+  Fri    .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  1  .  .  .  .  .  .  .  .
+  Sat    .  .  .  .  1  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .
+
+  FEATURE AREA USAGE  (API resource types, org-wide)
+  ──────────────────────────────────────────────────────────────────────
+  token                           ██████████████░░░░░░      72 requests
+  team                            ████░░░░░░░░░░░░░░░░      22 requests
+
+  USER COHORT RETENTION  (grouped by join month)
+  ──────────────────────────────────────────────────────────────────────
+  Cohort         Size  Active  Retention
+  ───────────────────────────────────────
+  2025-03           1       1       100%
+  2025-12           1       1       100%
+  2026-01           5       2        40%
+  2026-02           1       0         0%
+  2026-03           1       1       100%
+  2026-04           1       1       100%
+
+  ORG ACTIVITY TREND  (combined logins + API events by month)
+  ──────────────────────────────────────────────────────────────────────
+  2026-01  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  1
+  2026-02  █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  2
+  2026-03  ██████████████░░░░░░░░░░░░░░░░  48
+  2026-04  ██████████████████░░░░░░░░░░░░  59
 ```
 
 ## Scoring
