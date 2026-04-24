@@ -312,6 +312,10 @@ Diff vs the previous snapshot — new users, changed scores, new assets, resolve
 
 ---
 
+## Sample report
+
+![Adoption Report](reports/samplereport.png)
+
 ## Example terminal output
 
 ```
