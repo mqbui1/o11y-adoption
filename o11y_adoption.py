@@ -134,7 +134,10 @@ def fetch_assets():
     detectors  = api_get("/v2/detector",  {"limit": 1000}).get("results", [])
     dashboards = api_get("/v2/dashboard", {"limit": 1000}).get("results", [])
     charts     = api_get("/v2/chart",     {"limit": 1000}).get("results", [])
-    tokens     = api_get("/v2/token",     {"limit": 1000}).get("results", [])
+    try:
+        tokens = api_get("/v2/token", {"limit": 1000}).get("results", [])
+    except Exception:
+        tokens = []
     return detectors, dashboards, charts, tokens
 
 
@@ -2056,6 +2059,8 @@ def analyze_apm_dependency_graph(apm_nodes, apm_edges, baseline_path=None):
         node["fp_count"] = node_fp_counts.get(node["id"], 0)
 
     max_weight = max(edge_weights.values()) if edge_weights else 1
+    if max_weight == 0:
+        max_weight = 1
     edges = [
         {"from": src, "to": dst,
          "weight": cnt,
